@@ -1,0 +1,51 @@
+# Example configuration for blockwheel_kv benchmark.
+
+# key-value database related parameters
+[blockwheel_kv]
+# blockwheel kv storage n-tree block size
+tree_block_size = 32
+# butcher task restart timeout (seconds) for blockwheel kv storage
+butcher_task_restart_sec = 1
+# manager task restart timeout (seconds) for blockwheel kv storage
+manager_task_restart_sec = 1
+# search tree task restart timeout (seconds) for blockwheel kv storage
+search_tree_task_restart_sec = 1
+# maximum number of simultaneously running blocks removing tasks for blockwheel kv storage
+search_tree_remove_tasks_limit = 64
+# mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
+search_tree_iter_send_buffer = 4
+
+# storage areas manager related parameters
+[blockwheel_wheels]
+# main task restart timeout (seconds) for blockwheel kv wheels task
+task_restart_sec = 1
+
+# actual storage areas list related parameters
+[[blockwheel_wheels.fss]]
+# backend file for blockwheel fs
+wheel_filename = "example.blocks"
+# initial size for backend file in case of creating new for blockwheel fs
+init_wheel_size_bytes = 134217728
+# main wheel task restart timeout (in seconds) for blockwheel fs
+wheel_task_restart_sec = 4
+# tasks pool limit for main wheel task in blockwheel fs
+wheel_task_tasks_limit = 64
+# work block size for fs ops in blockwheel fs
+work_block_size_bytes = 8388608
+# LRU cache maximum size (in bytes) in blockwheel fs
+lru_cache_size_bytes = 1048576
+# maximum number of simultaneously running defragmentation tasks in blockwheel fs
+defrag_parallel_tasks_limit = 4
+
+# bench related parameter
+[bench]
+# average number of entries in database to keep
+db_size = 12288
+# maximum number of parallel kv access tasks
+active_tasks = 512
+# total number of actions with kv database
+actions = 24576
+# maximum key size in bytes
+key_size_bytes = 32
+# maximum value size in bytes
+value_size_bytes = 4096
