@@ -128,6 +128,7 @@ fn main() -> Result<(), Error> {
 async fn run_blockwheel_kv(config: Config) -> Result<(), Error> {
     let supervisor_gen_server = SupervisorGenServer::new();
     let mut supervisor_pid = supervisor_gen_server.pid();
+    tokio::spawn(supervisor_gen_server.run());
 
     let blocks_pool = BytesPool::new();
     let version_provider = ero_blockwheel_kv::version::Provider::from_unix_epoch_seed();
@@ -399,7 +400,7 @@ async fn stress_loop(
                 let key_amount = rng.gen_range(1, limits.key_size_bytes);
                 let value_amount = rng.gen_range(1, limits.value_size_bytes);
 
-                log::info!(
+                log::debug!(
                     "{}. performing INSERT with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
                     actions_counter,
                     key_amount,
@@ -440,7 +441,7 @@ async fn stress_loop(
                     }
                 };
 
-                log::info!(
+                log::debug!(
                     "{}. performing REMOVE with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
                     actions_counter,
                     key.key_bytes.len(),
@@ -475,7 +476,7 @@ async fn stress_loop(
                 LookupKind::Range
             };
 
-            log::info!(
+            log::debug!(
                 "{}. performing {:?} LOOKUP with {} bytes key and {} value | {:?}, active = {:?}",
                 actions_counter,
                 lookup_kind,
