@@ -71,6 +71,7 @@ pub enum BackendCmd {
 struct Config {
     blockwheel_kv: toml_config::BlockwheelKv,
     blockwheel_wheels: toml_config::BlockwheelWheels,
+    sled: toml_config::Sled,
     bench: toml_config::Bench,
 }
 
@@ -79,6 +80,7 @@ enum Error {
     ConfigRead(io::Error),
     ConfigParse(toml::de::Error),
     TokioRuntime(io::Error),
+    Sled(sled::Error),
     Insert(ero_blockwheel_kv::InsertError),
     Lookup(ero_blockwheel_kv::LookupError),
     LookupRange(ero_blockwheel_kv::LookupRangeError),
@@ -115,17 +117,36 @@ fn main() -> Result<(), Error> {
         .build()
         .map_err(Error::TokioRuntime)?;
 
-    let _backend_cmd = cli_args.backend_cmd;
+    let mut data = DataIndex {
+        index: HashMap::new(),
+        data: Vec::new(),
+        current_version: 0,
+    };
+    let mut counter = Counter::default();
 
-    for fs_config in &config.blockwheel_wheels.fss {
-        fs::remove_file(&fs_config.wheel_filename).ok();
+    match cli_args.backend_cmd {
+        BackendCmd::BlockwheelKv => {
+            for fs_config in &config.blockwheel_wheels.fss {
+                fs::remove_file(&fs_config.wheel_filename).ok();
+            }
+            runtime.block_on(run_blockwheel_kv(config.clone(), &mut data, &mut counter))?;
+        },
+        BackendCmd::Sled => {
+            fs::remove_dir_all(&config.sled.directory).ok();
+            runtime.block_on(run_sled(config.clone(), &mut data, &mut counter))?;
+        },
     }
 
-    runtime.block_on(run_blockwheel_kv(config.clone()))?;
     Ok(())
 }
 
-async fn run_blockwheel_kv(config: Config) -> Result<(), Error> {
+async fn run_blockwheel_kv(
+    config: Config,
+    data: &mut DataIndex,
+    counter: &mut Counter,
+)
+    -> Result<(), Error>
+{
     let supervisor_gen_server = SupervisorGenServer::new();
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
@@ -199,16 +220,33 @@ async fn run_blockwheel_kv(config: Config) -> Result<(), Error> {
         ),
     );
 
-    let mut data = DataIndex {
-        index: HashMap::new(),
-        data: Vec::new(),
-        current_version: 0,
-    };
-    let mut counter = Counter::default();
-
-    stress_loop(&mut supervisor_pid, blockwheel_kv_pid.clone(), &blocks_pool, &mut data, &mut counter, &config.bench).await?;
+    stress_loop(
+        &mut supervisor_pid,
+        Backend::BlockwheelKv { wheel_kv_pid: blockwheel_kv_pid.clone(), },
+        &blocks_pool,
+        data,
+        counter,
+        &config.bench,
+    ).await?;
 
     Ok(())
+}
+
+async fn run_sled(
+    config: Config,
+    data: &mut DataIndex,
+    counter: &mut Counter,
+)
+    -> Result<(), Error>
+{
+    let supervisor_gen_server = SupervisorGenServer::new();
+    let mut supervisor_pid = supervisor_gen_server.pid();
+    tokio::spawn(supervisor_gen_server.run());
+
+    let sled_tree = sled::open(&config.sled.directory)
+        .map_err(Error::Sled)?;
+
+    unimplemented!()
 }
 
 
@@ -239,9 +277,15 @@ struct DataIndex {
     current_version: u64,
 }
 
+#[derive(Clone)]
+enum Backend {
+    BlockwheelKv { wheel_kv_pid: ero_blockwheel_kv::Pid, },
+    Sled { database: sled::Db, },
+}
+
 async fn stress_loop(
     supervisor_pid: &mut SupervisorPid,
-    mut wheel_kv_pid: ero_blockwheel_kv::Pid,
+    mut backend: Backend,
     blocks_pool: &BytesPool,
     data: &mut DataIndex,
     counter: &mut Counter,
@@ -255,30 +299,325 @@ async fn stress_loop(
     let mut active_tasks_counter = Counter::default();
     let mut actions_counter = 0;
 
-    enum TaskDone {
-        Lookup { key: kv::Key, found_value_cell: kv::ValueCell, version_snapshot: u64, lookup_kind: LookupKind, },
-        Insert { key: kv::Key, value: kv::Value, version: u64, },
-        Remove { key: kv::Key, version: u64, },
+    let bench_start = Instant::now();
+
+    loop {
+        if actions_counter >= limits.actions {
+            std::mem::drop(done_tx);
+
+            while active_tasks_counter.sum() > 0 {
+                log::debug!("terminating, waiting for {} tasks to finish | active = {:?}", active_tasks_counter.sum(), active_tasks_counter);
+                let done_task: TaskDone = done_rx.next().await.unwrap()?;
+                done_task.process(data, counter, &mut active_tasks_counter)?;
+            }
+            break;
+        }
+        let maybe_task_result =
+            if (active_tasks_counter.sum() >= limits.active_tasks) || (data.data.is_empty() && active_tasks_counter.inserts > 0) {
+                Some(done_rx.next().await.unwrap())
+            } else {
+                select! {
+                    task_result = done_rx.next() =>
+                        Some(task_result.unwrap()),
+                    default =>
+                        None,
+                }
+            };
+        match maybe_task_result {
+            None =>
+                (),
+            Some(task_result) => {
+                let done_task: TaskDone = task_result?;
+                done_task.process(data, counter, &mut active_tasks_counter)?;
+                continue;
+            }
+        }
+
+        // construct action and run task
+        if data.data.is_empty() || rng.gen_range(0.0, 1.0) < 0.5 {
+            // insert or remove task
+            let insert_prob = 1.0 - (data.data.len() as f64 / limits.db_size as f64);
+            let dice = rng.gen_range(0.0, 1.0);
+            if data.data.is_empty() || dice < insert_prob {
+                // insert task
+                let key_amount = rng.gen_range(1, limits.key_size_bytes);
+                let value_amount = rng.gen_range(1, limits.value_size_bytes);
+
+                log::debug!(
+                    "{}. performing INSERT with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
+                    actions_counter,
+                    key_amount,
+                    value_amount,
+                    dice,
+                    insert_prob,
+                    counter,
+                    active_tasks_counter,
+                );
+
+                backend.spawn_insert_task(supervisor_pid, &done_tx, &blocks_pool, key_amount, value_amount);
+                active_tasks_counter.inserts += 1;
+            } else {
+                // remove task
+                let (key, value) = loop {
+                    let key_index = rng.gen_range(0, data.data.len());
+                    let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
+                    match &value_cell.cell {
+                        kv::Cell::Value(value) =>
+                            break (key, value),
+                        kv::Cell::Tombstone =>
+                            continue,
+                    }
+                };
+
+                log::debug!(
+                    "{}. performing REMOVE with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
+                    actions_counter,
+                    key.key_bytes.len(),
+                    value.value_bytes.len(),
+                    dice,
+                    1.0 - insert_prob,
+                    counter,
+                    active_tasks_counter,
+                );
+
+                let key = key.clone();
+                backend.spawn_remove_task(supervisor_pid, &done_tx, key);
+                active_tasks_counter.removes += 1;
+            }
+        } else {
+            // lookup task
+            let key_index = rng.gen_range(0, data.data.len());
+            let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
+            let version_snapshot = data.current_version;
+
+            let lookup_kind = if rng.gen_range(0.0, 1.0) < 0.5 {
+                LookupKind::Single
+            } else {
+                LookupKind::Range
+            };
+
+            log::debug!(
+                "{}. performing {:?} LOOKUP with {} bytes key and {} value | {:?}, active = {:?}",
+                actions_counter,
+                lookup_kind,
+                key.key_bytes.len(),
+                match &value_cell.cell {
+                    kv::Cell::Value(value) =>
+                        format!("{} bytes", value.value_bytes.len()),
+                    kv::Cell::Tombstone =>
+                        "tombstone".to_string(),
+                },
+                counter,
+                active_tasks_counter,
+            );
+
+            let key = key.clone();
+            let value_cell = value_cell.clone();
+
+            match lookup_kind {
+                LookupKind::Single => {
+                    backend.spawn_lookup_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot);
+                    active_tasks_counter.lookups += 1;
+                },
+                LookupKind::Range => {
+                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot);
+                    active_tasks_counter.lookups_range += 1;
+                },
+            }
+        }
+        actions_counter += 1;
     }
 
-    #[derive(Debug)]
-    enum LookupKind { Single, Range, };
+    assert!(done_rx.next().await.is_none());
 
-    fn spawn_task<T>(
+    backend.flush().await?;
+
+    log::info!("FINISHED bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
+
+    Ok(())
+}
+
+impl Backend {
+    fn spawn_insert_task(
+        &mut self,
         supervisor_pid: &mut SupervisorPid,
-        mut done_tx: mpsc::Sender<Result<TaskDone, Error>>,
-        task: T,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
+        key_amount: usize,
+        value_amount: usize,
     )
-    where T: Future<Output = Result<TaskDone, Error>> + Send + 'static
     {
-        supervisor_pid.spawn_link_temporary(async move {
-            let result = task.await;
-            done_tx.send(result).await.ok();
-        })
+        match self {
+            Backend::BlockwheelKv { wheel_kv_pid, } => {
+                let mut wheel_kv_pid = wheel_kv_pid.clone();
+                let blocks_pool = blocks_pool.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let mut block = blocks_pool.lend();
+                    block.resize(key_amount, 0);
+                    rand::thread_rng().fill(&mut block[..]);
+                    let key = kv::Key { key_bytes: block.freeze(), };
+                    let mut block = blocks_pool.lend();
+                    block.resize(value_amount, 0);
+                    rand::thread_rng().fill(&mut block[..]);
+                    let value = kv::Value { value_bytes: block.freeze(), };
+                    match wheel_kv_pid.insert(key.clone(), value.clone()).await {
+                        Ok(ero_blockwheel_kv::Inserted { version, }) =>
+                            Ok(TaskDone::Insert { key, value, version, }),
+                        Err(error) =>
+                            Err(Error::Insert(error))
+                    }
+                });
+            },
+            Backend::Sled { database, } => {
+
+                unimplemented!()
+            },
+        }
     }
 
-    fn process(task_done: TaskDone, data: &mut DataIndex, counter: &mut Counter, active_tasks_counter: &mut Counter) -> Result<(), Error> {
-        match task_done {
+    fn spawn_lookup_task(
+        &mut self,
+        supervisor_pid: &mut SupervisorPid,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        key: kv::Key,
+        value_cell: kv::ValueCell,
+        version_snapshot: u64,
+    )
+    {
+        match self {
+            Backend::BlockwheelKv { wheel_kv_pid, } => {
+                let mut wheel_kv_pid = wheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    match wheel_kv_pid.lookup(key.clone()).await {
+                        Ok(None) =>
+                            Err(Error::ExpectedValueNotFound { key, value_cell, }),
+                        Ok(Some(found_value_cell)) =>
+                            Ok(TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind: LookupKind::Single, }),
+                        Err(error) =>
+                            Err(Error::Lookup(error))
+                    }
+                });
+            },
+            Backend::Sled { database, } => {
+
+                unimplemented!()
+            },
+        }
+    }
+
+    fn spawn_lookup_range_task(
+        &mut self,
+        supervisor_pid: &mut SupervisorPid,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        key: kv::Key,
+        value_cell: kv::ValueCell,
+        version_snapshot: u64,
+    )
+    {
+        match self {
+            Backend::BlockwheelKv { wheel_kv_pid, } => {
+                let mut wheel_kv_pid = wheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let mut lookup_range = wheel_kv_pid.lookup_range(key.clone() ..= key.clone()).await
+                        .map_err(Error::LookupRange)?;
+                    let result = match lookup_range.key_values_rx.next().await {
+                        None =>
+                            return Err(Error::UnexpectedLookupRangeRxFinish),
+                        Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
+                            TaskDone::Lookup {
+                                key: key.clone(),
+                                found_value_cell: key_value_pair.value_cell,
+                                version_snapshot,
+                                lookup_kind: LookupKind::Range,
+                            },
+                        Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
+                            return Err(Error::ExpectedValueNotFound { key, value_cell, }),
+                    };
+                    match lookup_range.key_values_rx.next().await {
+                        None =>
+                            return Err(Error::UnexpectedLookupRangeRxFinish),
+                        Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
+                            return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
+                        Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
+                            ()
+                    }
+                    assert!(lookup_range.key_values_rx.next().await.is_none());
+                    Ok(result)
+                });
+            },
+            Backend::Sled { database, } => {
+
+                unimplemented!()
+            },
+        }
+    }
+
+    fn spawn_remove_task(
+        &mut self,
+        supervisor_pid: &mut SupervisorPid,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        key: kv::Key,
+    )
+    {
+        match self {
+            Backend::BlockwheelKv { wheel_kv_pid, } => {
+                let mut wheel_kv_pid = wheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    match wheel_kv_pid.remove(key.clone()).await {
+                        Ok(ero_blockwheel_kv::Removed { version, }) =>
+                            Ok(TaskDone::Remove { key, version, }),
+                        Err(error) =>
+                            Err(Error::Remove(error))
+                    }
+                });
+            },
+            Backend::Sled { database, } => {
+
+                unimplemented!()
+            },
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), Error> {
+        match self {
+            Backend::BlockwheelKv { wheel_kv_pid, } => {
+                let ero_blockwheel_kv::Flushed = wheel_kv_pid.flush().await
+                    .map_err(Error::Flush)?;
+            },
+            Backend::Sled { database, } => {
+
+                unimplemented!()
+            },
+        }
+        Ok(())
+    }
+}
+
+enum TaskDone {
+    Lookup { key: kv::Key, found_value_cell: kv::ValueCell, version_snapshot: u64, lookup_kind: LookupKind, },
+    Insert { key: kv::Key, value: kv::Value, version: u64, },
+    Remove { key: kv::Key, version: u64, },
+}
+
+#[derive(Debug)]
+enum LookupKind { Single, Range, }
+
+fn spawn_task<T>(
+    supervisor_pid: &mut SupervisorPid,
+    mut done_tx: mpsc::Sender<Result<TaskDone, Error>>,
+    task: T,
+)
+where T: Future<Output = Result<TaskDone, Error>> + Send + 'static
+{
+    supervisor_pid.spawn_link_temporary(async move {
+        let result = task.await;
+        done_tx.send(result).await.ok();
+    })
+}
+
+impl TaskDone {
+    fn process(self, data: &mut DataIndex, counter: &mut Counter, active_tasks_counter: &mut Counter) -> Result<(), Error> {
+        match self {
             TaskDone::Insert { key, value, version, } => {
                 let data_cell = kv::KeyValuePair {
                     key: key.clone(),
@@ -355,201 +694,4 @@ async fn stress_loop(
         }
         Ok(())
     }
-
-    let bench_start = Instant::now();
-
-    loop {
-        if actions_counter >= limits.actions {
-            std::mem::drop(done_tx);
-
-            while active_tasks_counter.sum() > 0 {
-                log::debug!("terminating, waiting for {} tasks to finish | active = {:?}", active_tasks_counter.sum(), active_tasks_counter);
-                process(done_rx.next().await.unwrap()?, data, counter, &mut active_tasks_counter)?;
-            }
-            break;
-        }
-        let maybe_task_result =
-            if (active_tasks_counter.sum() >= limits.active_tasks) || (data.data.is_empty() && active_tasks_counter.inserts > 0) {
-                Some(done_rx.next().await.unwrap())
-            } else {
-                select! {
-                    task_result = done_rx.next() =>
-                        Some(task_result.unwrap()),
-                    default =>
-                        None,
-                }
-            };
-        match maybe_task_result {
-            None =>
-                (),
-            Some(task_result) => {
-                process(task_result?, data, counter, &mut active_tasks_counter)?;
-                continue;
-            }
-        }
-
-        // construct action and run task
-        if data.data.is_empty() || rng.gen_range(0.0, 1.0) < 0.5 {
-            // insert or remove task
-            let insert_prob = 1.0 - (data.data.len() as f64 / limits.db_size as f64);
-            let dice = rng.gen_range(0.0, 1.0);
-            if data.data.is_empty() || dice < insert_prob {
-                // insert task
-                let mut wheel_kv_pid = wheel_kv_pid.clone();
-                let blocks_pool = blocks_pool.clone();
-                let key_amount = rng.gen_range(1, limits.key_size_bytes);
-                let value_amount = rng.gen_range(1, limits.value_size_bytes);
-
-                log::debug!(
-                    "{}. performing INSERT with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
-                    actions_counter,
-                    key_amount,
-                    value_amount,
-                    dice,
-                    insert_prob,
-                    counter,
-                    active_tasks_counter,
-                );
-
-                spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    let mut block = blocks_pool.lend();
-                    block.resize(key_amount, 0);
-                    rand::thread_rng().fill(&mut block[..]);
-                    let key = kv::Key { key_bytes: block.freeze(), };
-                    let mut block = blocks_pool.lend();
-                    block.resize(value_amount, 0);
-                    rand::thread_rng().fill(&mut block[..]);
-                    let value = kv::Value { value_bytes: block.freeze(), };
-                    match wheel_kv_pid.insert(key.clone(), value.clone()).await {
-                        Ok(ero_blockwheel_kv::Inserted { version, }) =>
-                            Ok(TaskDone::Insert { key, value, version, }),
-                        Err(error) =>
-                            Err(Error::Insert(error))
-                    }
-                });
-                active_tasks_counter.inserts += 1;
-            } else {
-                // remove task
-                let (key, value) = loop {
-                    let key_index = rng.gen_range(0, data.data.len());
-                    let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
-                    match &value_cell.cell {
-                        kv::Cell::Value(value) =>
-                            break (key, value),
-                        kv::Cell::Tombstone =>
-                            continue,
-                    }
-                };
-
-                log::debug!(
-                    "{}. performing REMOVE with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
-                    actions_counter,
-                    key.key_bytes.len(),
-                    value.value_bytes.len(),
-                    dice,
-                    1.0 - insert_prob,
-                    counter,
-                    active_tasks_counter,
-                );
-
-                let key = key.clone();
-                let mut wheel_kv_pid = wheel_kv_pid.clone();
-                spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    match wheel_kv_pid.remove(key.clone()).await {
-                        Ok(ero_blockwheel_kv::Removed { version, }) =>
-                            Ok(TaskDone::Remove { key, version, }),
-                        Err(error) =>
-                            Err(Error::Remove(error))
-                    }
-                });
-                active_tasks_counter.removes += 1;
-            }
-        } else {
-            // lookup task
-            let key_index = rng.gen_range(0, data.data.len());
-            let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
-            let version_snapshot = data.current_version;
-
-            let lookup_kind = if rng.gen_range(0.0, 1.0) < 0.5 {
-                LookupKind::Single
-            } else {
-                LookupKind::Range
-            };
-
-            log::debug!(
-                "{}. performing {:?} LOOKUP with {} bytes key and {} value | {:?}, active = {:?}",
-                actions_counter,
-                lookup_kind,
-                key.key_bytes.len(),
-                match &value_cell.cell {
-                    kv::Cell::Value(value) =>
-                        format!("{} bytes", value.value_bytes.len()),
-                    kv::Cell::Tombstone =>
-                        "tombstone".to_string(),
-                },
-                counter,
-                active_tasks_counter,
-            );
-
-            let key = key.clone();
-            let value_cell = value_cell.clone();
-            let mut wheel_kv_pid = wheel_kv_pid.clone();
-
-            match lookup_kind {
-                LookupKind::Single => {
-                    spawn_task(supervisor_pid, done_tx.clone(), async move {
-                        match wheel_kv_pid.lookup(key.clone()).await {
-                            Ok(None) =>
-                                Err(Error::ExpectedValueNotFound { key, value_cell, }),
-                            Ok(Some(found_value_cell)) =>
-                                Ok(TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind: LookupKind::Single, }),
-                            Err(error) =>
-                                Err(Error::Lookup(error))
-                        }
-                    });
-                    active_tasks_counter.lookups += 1;
-                },
-                LookupKind::Range => {
-                    spawn_task(supervisor_pid, done_tx.clone(), async move {
-                        let mut lookup_range = wheel_kv_pid.lookup_range(key.clone() ..= key.clone()).await
-                            .map_err(Error::LookupRange)?;
-                        let result = match lookup_range.key_values_rx.next().await {
-                            None =>
-                                return Err(Error::UnexpectedLookupRangeRxFinish),
-                            Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
-                                TaskDone::Lookup {
-                                    key: key.clone(),
-                                    found_value_cell: key_value_pair.value_cell,
-                                    version_snapshot,
-                                    lookup_kind: LookupKind::Range,
-                                },
-                            Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
-                                return Err(Error::ExpectedValueNotFound { key, value_cell, }),
-                        };
-                        match lookup_range.key_values_rx.next().await {
-                            None =>
-                                return Err(Error::UnexpectedLookupRangeRxFinish),
-                            Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
-                                return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
-                            Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
-                                ()
-                        }
-                        assert!(lookup_range.key_values_rx.next().await.is_none());
-                        Ok(result)
-                    });
-                    active_tasks_counter.lookups_range += 1;
-                },
-            }
-        }
-        actions_counter += 1;
-    }
-
-    assert!(done_rx.next().await.is_none());
-
-    let ero_blockwheel_kv::Flushed = wheel_kv_pid.flush().await
-        .map_err(Error::Flush)?;
-
-    log::info!("FINISHED bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
-
-    Ok(())
 }

@@ -32,6 +32,11 @@ pub struct BlockwheelFs {
 }
 
 #[derive(Clone, Deserialize, Debug)]
+pub struct Sled {
+    pub directory: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Debug)]
 pub struct Bench {
     pub db_size: usize,
     pub active_tasks: usize,
