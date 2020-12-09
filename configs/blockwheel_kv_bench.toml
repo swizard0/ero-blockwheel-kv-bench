@@ -1,6 +1,6 @@
 # Example configuration for blockwheel_kv benchmark.
 
-# key-value database related parameters
+# blockwheel_kv key-value database related parameters
 [blockwheel_kv]
 # blockwheel kv storage n-tree block size
 tree_block_size = 32
@@ -23,7 +23,7 @@ task_restart_sec = 1
 # actual storage areas list related parameters
 [[blockwheel_wheels.fss]]
 # backend file for blockwheel fs
-wheel_filename = "example.blocks"
+wheel_filename = "blockwheel_kv.blocks"
 # initial size for backend file in case of creating new for blockwheel fs
 init_wheel_size_bytes = 134217728
 # main wheel task restart timeout (in seconds) for blockwheel fs
@@ -36,6 +36,10 @@ work_block_size_bytes = 8388608
 lru_cache_size_bytes = 1048576
 # maximum number of simultaneously running defragmentation tasks in blockwheel fs
 defrag_parallel_tasks_limit = 4
+
+# sled key-value database related parameters
+[sled]
+directory = "sled_database"
 
 # bench related parameter
 [bench]
