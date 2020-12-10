@@ -650,14 +650,22 @@ impl TaskDone {
                         cell: kv::Cell::Value(value.clone()),
                     },
                 };
-                if let Some(&offset) = data.index.get(&key) {
-                    data.data[offset] = data_cell;
+                let updated = if let Some(&offset) = data.index.get(&key) {
+                    if data.data[offset].value_cell.version < data_cell.value_cell.version {
+                        data.data[offset] = data_cell;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     let offset = data.data.len();
                     data.data.push(data_cell);
                     data.index.insert(key, offset);
+                    true
+                };
+                if updated {
+                    data.current_version = version;
                 }
-                data.current_version = version;
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
             },
