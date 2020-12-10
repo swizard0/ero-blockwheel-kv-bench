@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     io,
     fs,
@@ -81,6 +83,7 @@ enum Error {
     ConfigParse(toml::de::Error),
     TokioRuntime(io::Error),
     Sled(sled::Error),
+    GenTaskJoin(tokio::task::JoinError),
     Insert(ero_blockwheel_kv::InsertError),
     Lookup(ero_blockwheel_kv::LookupError),
     LookupRange(ero_blockwheel_kv::LookupRangeError),
@@ -243,10 +246,21 @@ async fn run_sled(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
+    let blocks_pool = BytesPool::new();
+
     let sled_tree = sled::open(&config.sled.directory)
         .map_err(Error::Sled)?;
 
-    unimplemented!()
+    stress_loop(
+        &mut supervisor_pid,
+        Backend::Sled { database: sled_tree, },
+        &blocks_pool,
+        data,
+        counter,
+        &config.bench,
+    ).await?;
+
+    Ok(())
 }
 
 
@@ -452,14 +466,24 @@ impl Backend {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let blocks_pool = blocks_pool.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    let mut block = blocks_pool.lend();
-                    block.resize(key_amount, 0);
-                    rand::thread_rng().fill(&mut block[..]);
-                    let key = kv::Key { key_bytes: block.freeze(), };
-                    let mut block = blocks_pool.lend();
-                    block.resize(value_amount, 0);
-                    rand::thread_rng().fill(&mut block[..]);
-                    let value = kv::Value { value_bytes: block.freeze(), };
+                    let mut key_block = blocks_pool.lend();
+                    let mut value_block = blocks_pool.lend();
+                    let gen_task = tokio::task::spawn_blocking(move || {
+                        let mut rng = rand::thread_rng();
+                        key_block.reserve(key_amount);
+                        for _ in 0 .. key_amount {
+                            key_block.push(rng.gen());
+                        }
+                        value_block.reserve(value_amount);
+                        for _ in 0 .. value_amount {
+                            value_block.push(rng.gen());
+                        }
+                        (key_block.freeze(), value_block.freeze())
+                    });
+                    let (key_bytes, value_bytes) = gen_task.await
+                        .map_err(Error::GenTaskJoin)?;
+                    let key = kv::Key { key_bytes, };
+                    let value = kv::Value { value_bytes, };
                     match wheel_kv_pid.insert(key.clone(), value.clone()).await {
                         Ok(ero_blockwheel_kv::Inserted { version, }) =>
                             Ok(TaskDone::Insert { key, value, version, }),
@@ -468,7 +492,7 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database, } => {
+            Backend::Sled { database: _, } => {
 
                 unimplemented!()
             },
@@ -498,7 +522,7 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database, } => {
+            Backend::Sled { database: _, } => {
 
                 unimplemented!()
             },
@@ -545,7 +569,7 @@ impl Backend {
                     Ok(result)
                 });
             },
-            Backend::Sled { database, } => {
+            Backend::Sled { database: _, } => {
 
                 unimplemented!()
             },
@@ -571,7 +595,7 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database, } => {
+            Backend::Sled { database: _, } => {
 
                 unimplemented!()
             },
@@ -584,7 +608,7 @@ impl Backend {
                 let ero_blockwheel_kv::Flushed = wheel_kv_pid.flush().await
                     .map_err(Error::Flush)?;
             },
-            Backend::Sled { database, } => {
+            Backend::Sled { database: _, } => {
 
                 unimplemented!()
             },
