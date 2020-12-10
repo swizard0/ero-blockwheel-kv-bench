@@ -3,7 +3,10 @@
 use std::{
     io,
     fs,
-    time::Instant,
+    time::{
+        Instant,
+        Duration,
+    },
     path::PathBuf,
     collections::HashMap,
 };
@@ -89,6 +92,11 @@ enum Error {
     LookupRange(ero_blockwheel_kv::LookupRangeError),
     Remove(ero_blockwheel_kv::RemoveError),
     Flush(ero_blockwheel_kv::FlushError),
+    InsertTimedOut { key: kv::Key, },
+    LookupTimedOut { key: kv::Key, },
+    LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, },
+    RemoveTimedOut { key: kv::Key, },
+    FlushTimedOut,
     ExpectedValueNotFound {
         key: kv::Key,
         value_cell: kv::ValueCell,
@@ -368,7 +376,7 @@ async fn stress_loop(
                     active_tasks_counter,
                 );
 
-                backend.spawn_insert_task(supervisor_pid, &done_tx, &blocks_pool, key_amount, value_amount);
+                backend.spawn_insert_task(supervisor_pid, &done_tx, &blocks_pool, key_amount, value_amount, &limits);
                 active_tasks_counter.inserts += 1;
             } else {
                 // remove task
@@ -395,7 +403,7 @@ async fn stress_loop(
                 );
 
                 let key = key.clone();
-                backend.spawn_remove_task(supervisor_pid, &done_tx, key);
+                backend.spawn_remove_task(supervisor_pid, &done_tx, key, &limits);
                 active_tasks_counter.removes += 1;
             }
         } else {
@@ -430,11 +438,11 @@ async fn stress_loop(
 
             match lookup_kind {
                 LookupKind::Single => {
-                    backend.spawn_lookup_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot);
+                    backend.spawn_lookup_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot, &limits);
                     active_tasks_counter.lookups += 1;
                 },
                 LookupKind::Range => {
-                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot);
+                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot, &limits);
                     active_tasks_counter.lookups_range += 1;
                 },
             }
@@ -444,7 +452,7 @@ async fn stress_loop(
 
     assert!(done_rx.next().await.is_none());
 
-    backend.flush().await?;
+    backend.flush(&limits).await?;
 
     log::info!("FINISHED bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
 
@@ -459,12 +467,14 @@ impl Backend {
         blocks_pool: &BytesPool,
         key_amount: usize,
         value_amount: usize,
+        limits: &toml_config::Bench,
     )
     {
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let blocks_pool = blocks_pool.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let mut key_block = blocks_pool.lend();
                     let mut value_block = blocks_pool.lend();
@@ -484,11 +494,17 @@ impl Backend {
                         .map_err(Error::GenTaskJoin)?;
                     let key = kv::Key { key_bytes, };
                     let value = kv::Value { value_bytes, };
-                    match wheel_kv_pid.insert(key.clone(), value.clone()).await {
-                        Ok(ero_blockwheel_kv::Inserted { version, }) =>
+                    let insert_task = tokio::time::timeout(
+                        op_timeout,
+                        wheel_kv_pid.insert(key.clone(), value.clone()),
+                    );
+                    match insert_task.await {
+                        Ok(Ok(ero_blockwheel_kv::Inserted { version, })) =>
                             Ok(TaskDone::Insert { key, value, version, }),
-                        Err(error) =>
-                            Err(Error::Insert(error))
+                        Ok(Err(error)) =>
+                            Err(Error::Insert(error)),
+                        Err(..) =>
+                            Err(Error::InsertTimedOut { key, }),
                     }
                 });
             },
@@ -506,19 +522,27 @@ impl Backend {
         key: kv::Key,
         value_cell: kv::ValueCell,
         version_snapshot: u64,
+        limits: &toml_config::Bench,
     )
     {
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    match wheel_kv_pid.lookup(key.clone()).await {
-                        Ok(None) =>
+                    let lookup_task = tokio::time::timeout(
+                        op_timeout,
+                        wheel_kv_pid.lookup(key.clone()),
+                    );
+                    match lookup_task.await {
+                        Ok(Ok(None)) =>
                             Err(Error::ExpectedValueNotFound { key, value_cell, }),
-                        Ok(Some(found_value_cell)) =>
+                        Ok(Ok(Some(found_value_cell))) =>
                             Ok(TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind: LookupKind::Single, }),
-                        Err(error) =>
-                            Err(Error::Lookup(error))
+                        Ok(Err(error)) =>
+                            Err(Error::Lookup(error)),
+                        Err(..) =>
+                            Err(Error::LookupTimedOut { key, }),
                     }
                 });
             },
@@ -536,34 +560,56 @@ impl Backend {
         key: kv::Key,
         value_cell: kv::ValueCell,
         version_snapshot: u64,
+        limits: &toml_config::Bench,
     )
     {
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_lookup_range_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    let mut lookup_range = wheel_kv_pid.lookup_range(key.clone() ..= key.clone()).await
-                        .map_err(Error::LookupRange)?;
-                    let result = match lookup_range.key_values_rx.next().await {
-                        None =>
+                    let lookup_range_task = tokio::time::timeout(
+                        op_timeout,
+                        wheel_kv_pid.lookup_range(key.clone() ..= key.clone()),
+                    );
+                    let mut lookup_range = match lookup_range_task.await {
+                        Ok(result) =>
+                            result.map_err(Error::LookupRange)?,
+                        Err(..) =>
+                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, }),
+                    };
+                    let lookup_range_next_task = tokio::time::timeout(
+                        op_timeout,
+                        lookup_range.key_values_rx.next(),
+                    );
+                    let result = match lookup_range_next_task.await {
+                        Ok(None) =>
                             return Err(Error::UnexpectedLookupRangeRxFinish),
-                        Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) =>
                             TaskDone::Lookup {
                                 key: key.clone(),
                                 found_value_cell: key_value_pair.value_cell,
                                 version_snapshot,
                                 lookup_kind: LookupKind::Range,
                             },
-                        Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
                             return Err(Error::ExpectedValueNotFound { key, value_cell, }),
+                        Err(..) =>
+                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, }),
                     };
-                    match lookup_range.key_values_rx.next().await {
-                        None =>
+                    let lookup_range_next_task = tokio::time::timeout(
+                        op_timeout,
+                        lookup_range.key_values_rx.next(),
+                    );
+                    match lookup_range_next_task.await {
+                        Ok(None) =>
                             return Err(Error::UnexpectedLookupRangeRxFinish),
-                        Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair)) =>
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) =>
                             return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
-                        Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore) =>
-                            ()
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
+                            (),
+                        Err(..) =>
+                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, }),
                     }
                     assert!(lookup_range.key_values_rx.next().await.is_none());
                     Ok(result)
@@ -581,17 +627,25 @@ impl Backend {
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         key: kv::Key,
+        limits: &toml_config::Bench,
     )
     {
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    match wheel_kv_pid.remove(key.clone()).await {
-                        Ok(ero_blockwheel_kv::Removed { version, }) =>
+                    let remove_task = tokio::time::timeout(
+                        op_timeout,
+                        wheel_kv_pid.remove(key.clone()),
+                    );
+                    match remove_task.await {
+                        Ok(Ok(ero_blockwheel_kv::Removed { version, })) =>
                             Ok(TaskDone::Remove { key, version, }),
-                        Err(error) =>
-                            Err(Error::Remove(error))
+                        Ok(Err(error)) =>
+                            Err(Error::Remove(error)),
+                        Err(..) =>
+                            Err(Error::RemoveTimedOut { key, }),
                     }
                 });
             },
@@ -602,11 +656,17 @@ impl Backend {
         }
     }
 
-    async fn flush(&mut self) -> Result<(), Error> {
+    async fn flush(&mut self, limits: &toml_config::Bench) -> Result<(), Error> {
+        let op_timeout = Duration::from_secs(limits.timeout_flush_secs);
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, } => {
-                let ero_blockwheel_kv::Flushed = wheel_kv_pid.flush().await
-                    .map_err(Error::Flush)?;
+                let flush_task = tokio::time::timeout(
+                    op_timeout,
+                    wheel_kv_pid.flush(),
+                );
+                let ero_blockwheel_kv::Flushed = flush_task.await
+                    .map_err(|_| Error::FlushTimedOut)
+                    .and_then(|result| result.map_err(Error::Flush))?;
             },
             Backend::Sled { database: _, } => {
 

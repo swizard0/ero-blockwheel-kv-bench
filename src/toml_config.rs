@@ -43,4 +43,9 @@ pub struct Bench {
     pub actions: usize,
     pub key_size_bytes: usize,
     pub value_size_bytes: usize,
+    pub timeout_insert_secs: u64,
+    pub timeout_lookup_secs: u64,
+    pub timeout_lookup_range_secs: u64,
+    pub timeout_remove_secs: u64,
+    pub timeout_flush_secs: u64,
 }
