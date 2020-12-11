@@ -34,6 +34,9 @@ pub struct BlockwheelFs {
 #[derive(Clone, Deserialize, Debug)]
 pub struct Sled {
     pub directory: PathBuf,
+    pub cache_capacity: u64,
+    pub mode: String,
+    pub print_profile_on_drop: bool,
 }
 
 #[derive(Clone, Deserialize, Debug)]

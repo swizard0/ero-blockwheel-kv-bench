@@ -7,6 +7,7 @@ use std::{
         Instant,
         Duration,
     },
+    sync::Arc,
     path::PathBuf,
     collections::HashMap,
 };
@@ -84,15 +85,19 @@ struct Config {
 enum Error {
     ConfigRead(io::Error),
     ConfigParse(toml::de::Error),
+    SledInvalidMode { mode_provided: String, },
     TokioRuntime(io::Error),
     Sled(sled::Error),
     GenTaskJoin(tokio::task::JoinError),
     Insert(ero_blockwheel_kv::InsertError),
+    InsertSled(sled::Error),
+    InsertTaskJoin(tokio::task::JoinError),
     Lookup(ero_blockwheel_kv::LookupError),
     LookupRange(ero_blockwheel_kv::LookupRangeError),
     Remove(ero_blockwheel_kv::RemoveError),
     Flush(ero_blockwheel_kv::FlushError),
     InsertTimedOut { key: kv::Key, },
+    InsertTimedOutNoKey,
     LookupTimedOut { key: kv::Key, },
     LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, },
     RemoveTimedOut { key: kv::Key, },
@@ -260,12 +265,26 @@ async fn run_sled(
 
     let blocks_pool = BytesPool::new();
 
-    let sled_tree = sled::open(&config.sled.directory)
+    let sled_tree = sled::Config::new()
+        .path(&config.sled.directory)
+        .cache_capacity(config.sled.cache_capacity)
+        .mode(match &*config.sled.mode {
+            "fast" =>
+                sled::Mode::HighThroughput,
+            "small" =>
+                sled::Mode::LowSpace,
+            other =>
+                return Err(Error::SledInvalidMode { mode_provided: other.to_string(), }),
+        })
+        .print_profile_on_drop(config.sled.print_profile_on_drop)
+        .open()
         .map_err(Error::Sled)?;
 
     stress_loop(
         &mut supervisor_pid,
-        Backend::Sled { database: sled_tree, },
+        Backend::Sled {
+            database: Arc::new(sled_tree),
+        },
         &blocks_pool,
         data,
         counter,
@@ -309,7 +328,7 @@ enum Backend {
         wheel_kv_pid: ero_blockwheel_kv::Pid,
         wheels_pid: ero_blockwheel_kv::wheels::Pid,
     },
-    Sled { database: sled::Db, },
+    Sled { database: Arc<sled::Db>, },
 }
 
 async fn stress_loop(
@@ -515,9 +534,39 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database: _, } => {
-
-                unimplemented!()
+            Backend::Sled { database, } => {
+                let database = database.clone();
+                let blocks_pool = blocks_pool.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let insert_task = tokio::task::spawn_blocking(move || {
+                        let mut key_block = blocks_pool.lend();
+                        let mut value_block = blocks_pool.lend();
+                        let mut rng = rand::thread_rng();
+                        key_block.reserve(key_amount);
+                        for _ in 0 .. key_amount {
+                            key_block.push(rng.gen());
+                        }
+                        value_block.reserve(value_amount);
+                        for _ in 0 .. value_amount {
+                            value_block.push(rng.gen());
+                        }
+                        let key = kv::Key { key_bytes: key_block.freeze(), };
+                        let value = kv::Value { value_bytes: value_block.freeze(), };
+                        database.insert(&**key.key_bytes, &**value.value_bytes)
+                            .map(|_| TaskDone::Insert { key, value, version: 0, })
+                    });
+                    match tokio::time::timeout(op_timeout, insert_task).await {
+                        Ok(Ok(Ok(task_done))) =>
+                            Ok(task_done),
+                        Ok(Ok(Err(error))) =>
+                            Err(Error::InsertSled(error)),
+                        Ok(Err(error)) =>
+                            Err(Error::InsertTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::InsertTimedOutNoKey),
+                    }
+                });
             },
         }
     }
