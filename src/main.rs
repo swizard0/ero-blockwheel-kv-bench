@@ -111,6 +111,7 @@ enum Error {
         key_value_pair: kv::KeyValuePair,
     },
     UnexpectedLookupRangeRxFinish,
+    WheelsGoneDuringFlush,
 }
 
 fn main() -> Result<(), Error> {
@@ -233,7 +234,10 @@ async fn run_blockwheel_kv(
 
     stress_loop(
         &mut supervisor_pid,
-        Backend::BlockwheelKv { wheel_kv_pid: blockwheel_kv_pid.clone(), },
+        Backend::BlockwheelKv {
+            wheel_kv_pid: blockwheel_kv_pid.clone(),
+            wheels_pid,
+        },
         &blocks_pool,
         data,
         counter,
@@ -301,7 +305,10 @@ struct DataIndex {
 
 #[derive(Clone)]
 enum Backend {
-    BlockwheelKv { wheel_kv_pid: ero_blockwheel_kv::Pid, },
+    BlockwheelKv {
+        wheel_kv_pid: ero_blockwheel_kv::Pid,
+        wheels_pid: ero_blockwheel_kv::wheels::Pid,
+    },
     Sled { database: sled::Db, },
 }
 
@@ -471,7 +478,7 @@ impl Backend {
     )
     {
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let blocks_pool = blocks_pool.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
@@ -526,7 +533,7 @@ impl Backend {
     )
     {
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -564,7 +571,7 @@ impl Backend {
     )
     {
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_lookup_range_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -631,7 +638,7 @@ impl Backend {
     )
     {
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -659,7 +666,7 @@ impl Backend {
     async fn flush(&mut self, limits: &toml_config::Bench) -> Result<(), Error> {
         let op_timeout = Duration::from_secs(limits.timeout_flush_secs);
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, wheels_pid, } => {
                 let flush_task = tokio::time::timeout(
                     op_timeout,
                     wheel_kv_pid.flush(),
@@ -667,6 +674,13 @@ impl Backend {
                 let ero_blockwheel_kv::Flushed = flush_task.await
                     .map_err(|_| Error::FlushTimedOut)
                     .and_then(|result| result.map_err(Error::Flush))?;
+                let flush_task = tokio::time::timeout(
+                    op_timeout,
+                    wheels_pid.flush(),
+                );
+                let ero_blockwheel_kv::wheels::Flushed = flush_task.await
+                    .map_err(|_| Error::FlushTimedOut)
+                    .and_then(|result| result.map_err(|ero::NoProcError| Error::WheelsGoneDuringFlush))?;
             },
             Backend::Sled { database: _, } => {
 
