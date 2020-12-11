@@ -40,7 +40,7 @@ defrag_parallel_tasks_limit = 4
 # sled key-value database related parameters
 [sled]
 # the path of the database
-directory = "sled_database"
+directory = "database.sled"
 # maximum size in bytes for the system page cache
 cache_capacity = 1073741824
 # specify whether the system should run in \"small\" or \"fast\" mode

@@ -2,4 +2,4 @@
 *~
 Cargo.lock
 blockwheel_kv.blocks
-sled_database
+database.sled

@@ -93,9 +93,16 @@ enum Error {
     InsertSled(sled::Error),
     InsertTaskJoin(tokio::task::JoinError),
     Lookup(ero_blockwheel_kv::LookupError),
+    LookupSled(sled::Error),
+    LookupTaskJoin(tokio::task::JoinError),
     LookupRange(ero_blockwheel_kv::LookupRangeError),
+    LookupRangeSledNext(sled::Error),
+    LookupRangeSledLast(sled::Error),
     Remove(ero_blockwheel_kv::RemoveError),
+    RemoveSled(sled::Error),
+    RemoveTaskJoin(tokio::task::JoinError),
     Flush(ero_blockwheel_kv::FlushError),
+    FlushSled(sled::Error),
     InsertTimedOut { key: kv::Key, },
     InsertTimedOutNoKey,
     LookupTimedOut { key: kv::Key, },
@@ -105,6 +112,7 @@ enum Error {
     ExpectedValueNotFound {
         key: kv::Key,
         value_cell: kv::ValueCell,
+        lookup_kind: LookupKind,
     },
     UnexpectedValueFound {
         key: kv::Key,
@@ -464,11 +472,11 @@ async fn stress_loop(
 
             match lookup_kind {
                 LookupKind::Single => {
-                    backend.spawn_lookup_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot, &limits);
+                    backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, version_snapshot, &limits);
                     active_tasks_counter.lookups += 1;
                 },
                 LookupKind::Range => {
-                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, key, value_cell, version_snapshot, &limits);
+                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, version_snapshot, &limits);
                     active_tasks_counter.lookups_range += 1;
                 },
             }
@@ -575,6 +583,7 @@ impl Backend {
         &mut self,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
         key: kv::Key,
         value_cell: kv::ValueCell,
         version_snapshot: u64,
@@ -592,7 +601,7 @@ impl Backend {
                     );
                     match lookup_task.await {
                         Ok(Ok(None)) =>
-                            Err(Error::ExpectedValueNotFound { key, value_cell, }),
+                            Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
                         Ok(Ok(Some(found_value_cell))) =>
                             Ok(TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind: LookupKind::Single, }),
                         Ok(Err(error)) =>
@@ -602,9 +611,52 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database: _, } => {
-
-                unimplemented!()
+            Backend::Sled { database, } => {
+                let database = database.clone();
+                let blocks_pool = blocks_pool.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let sled_key = key.key_bytes.clone();
+                    let lookup_task = tokio::task::spawn_blocking(move || {
+                        database.get(&**sled_key)
+                    });
+                    match tokio::time::timeout(op_timeout, lookup_task).await {
+                        Ok(Ok(Ok(None))) =>
+                            match value_cell.cell {
+                                kv::Cell::Value(..) =>
+                                    Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
+                                kv::Cell::Tombstone =>
+                                    Ok(TaskDone::Lookup {
+                                        key,
+                                        found_value_cell: kv::ValueCell {
+                                            version: 0,
+                                            cell: kv::Cell::Tombstone,
+                                        },
+                                        version_snapshot,
+                                        lookup_kind: LookupKind::Single,
+                                    }),
+                            },
+                        Ok(Ok(Ok(Some(found_value_bin)))) => {
+                            let mut value_block = blocks_pool.lend();
+                            value_block.extend_from_slice(&found_value_bin);
+                            Ok(TaskDone::Lookup {
+                                key,
+                                found_value_cell: kv::ValueCell {
+                                    version: 0,
+                                    cell: kv::Cell::Value(value_block.into()),
+                                },
+                                version_snapshot,
+                                lookup_kind: LookupKind::Single,
+                            })
+                        },
+                        Ok(Ok(Err(error))) =>
+                            Err(Error::LookupSled(error)),
+                        Ok(Err(error)) =>
+                            Err(Error::LookupTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::LookupTimedOut { key, }),
+                    }
+                });
             },
         }
     }
@@ -613,6 +665,7 @@ impl Backend {
         &mut self,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
         key: kv::Key,
         value_cell: kv::ValueCell,
         version_snapshot: u64,
@@ -649,7 +702,7 @@ impl Backend {
                                 lookup_kind: LookupKind::Range,
                             },
                         Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
-                            return Err(Error::ExpectedValueNotFound { key, value_cell, }),
+                            return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
                         Err(..) =>
                             return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, }),
                     };
@@ -671,9 +724,75 @@ impl Backend {
                     Ok(result)
                 });
             },
-            Backend::Sled { database: _, } => {
-
-                unimplemented!()
+            Backend::Sled { database, } => {
+                let database = database.clone();
+                let blocks_pool = blocks_pool.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_lookup_range_secs);
+                let key_clone = key.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let sled_key = key.key_bytes.clone();
+                    let lookup_range_task = tokio::task::spawn_blocking(move || {
+                        let mut iter = database.range(&**sled_key ..= &**sled_key);
+                        let task_done = match iter.next() {
+                            None =>
+                                TaskDone::Lookup {
+                                    key: key.clone(),
+                                    found_value_cell: kv::ValueCell {
+                                        version: 0,
+                                        cell: kv::Cell::Tombstone,
+                                    },
+                                    version_snapshot,
+                                    lookup_kind: LookupKind::Range,
+                                },
+                            Some(Ok((_found_key_bin, found_value_bin))) => {
+                                let mut value_block = blocks_pool.lend();
+                                value_block.extend_from_slice(&found_value_bin);
+                                TaskDone::Lookup {
+                                    key: key.clone(),
+                                    found_value_cell: kv::ValueCell {
+                                        version: 0,
+                                        cell: kv::Cell::Value(value_block.into()),
+                                    },
+                                    version_snapshot,
+                                    lookup_kind: LookupKind::Range,
+                                }
+                            },
+                            Some(Err(error)) =>
+                                return Err(Error::LookupRangeSledNext(error)),
+                        };
+                        match iter.next() {
+                            None =>
+                                (),
+                            Some(Ok((found_key_bin, found_value_bin))) => {
+                                let mut key_block = blocks_pool.lend();
+                                key_block.extend_from_slice(&found_key_bin);
+                                let mut value_block = blocks_pool.lend();
+                                value_block.extend_from_slice(&found_value_bin);
+                                return Err(Error::UnexpectedValueForLookupRange {
+                                    key: key,
+                                    key_value_pair: kv::KeyValuePair {
+                                        key: key_block.into(),
+                                        value_cell: kv::ValueCell {
+                                            version: 0,
+                                            cell: kv::Cell::Value(value_block.into()),
+                                        },
+                                    },
+                                });
+                            },
+                            Some(Err(error)) =>
+                                return Err(Error::LookupRangeSledLast(error)),
+                        }
+                        Ok(task_done)
+                    });
+                    match tokio::time::timeout(op_timeout, lookup_range_task).await {
+                        Ok(Ok(result)) =>
+                            result,
+                        Ok(Err(error)) =>
+                            Err(Error::LookupTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::LookupTimedOut { key: key_clone, }),
+                    }
+                });
             },
         }
     }
@@ -705,9 +824,25 @@ impl Backend {
                     }
                 });
             },
-            Backend::Sled { database: _, } => {
-
-                unimplemented!()
+            Backend::Sled { database, } => {
+                let database = database.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let sled_key = key.key_bytes.clone();
+                    let remove_task = tokio::task::spawn_blocking(move || {
+                        database.remove(&**sled_key)
+                    });
+                    match tokio::time::timeout(op_timeout, remove_task).await {
+                        Ok(Ok(Ok(..))) =>
+                            Ok(TaskDone::Remove { key, version: 0, }),
+                        Ok(Ok(Err(error))) =>
+                            Err(Error::RemoveSled(error)),
+                        Ok(Err(error)) =>
+                            Err(Error::RemoveTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::RemoveTimedOut { key, }),
+                    }
+                });
             },
         }
     }
@@ -731,9 +866,14 @@ impl Backend {
                     .map_err(|_| Error::FlushTimedOut)
                     .and_then(|result| result.map_err(|ero::NoProcError| Error::WheelsGoneDuringFlush))?;
             },
-            Backend::Sled { database: _, } => {
-
-                unimplemented!()
+            Backend::Sled { database, } => {
+                let flush_task = tokio::time::timeout(
+                    op_timeout,
+                    database.flush_async(),
+                );
+                flush_task.await
+                    .map_err(|_| Error::FlushTimedOut)
+                    .and_then(|result| result.map_err(Error::FlushSled))?;
             },
         }
         Ok(())
@@ -845,6 +985,8 @@ impl TaskDone {
                 data.current_version = version;
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
+
+                log::warn!("removed key: {:?}", key);
             },
         }
         Ok(())
