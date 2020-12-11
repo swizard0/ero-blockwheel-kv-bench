@@ -328,7 +328,7 @@ async fn stress_loop(
             std::mem::drop(done_tx);
 
             while active_tasks_counter.sum() > 0 {
-                log::info!("terminating, waiting for {} tasks to finish | active = {:?}", active_tasks_counter.sum(), active_tasks_counter);
+                log::debug!("terminating, waiting for {} tasks to finish | active = {:?}", active_tasks_counter.sum(), active_tasks_counter);
                 let done_task: TaskDone = done_rx.next().await.unwrap()?;
                 done_task.process(data, counter, &mut active_tasks_counter)?;
             }
