@@ -20,6 +20,7 @@ use structopt::{
 };
 
 use serde_derive::{
+    Serialize,
     Deserialize,
 };
 
@@ -118,6 +119,7 @@ enum Error {
         key: kv::Key,
         expected_value_cell: kv::ValueCell,
         found_value_cell: kv::ValueCell,
+        version_snapshot: u64,
     },
     UnexpectedValueForLookupRange {
         key: kv::Key,
@@ -125,6 +127,8 @@ enum Error {
     },
     UnexpectedLookupRangeRxFinish,
     WheelsGoneDuringFlush,
+    SledSerialize(bincode::Error),
+    SledDeserialize(bincode::Error),
 }
 
 fn main() -> Result<(), Error> {
@@ -252,6 +256,7 @@ async fn run_blockwheel_kv(
             wheels_pid,
         },
         &blocks_pool,
+        &version_provider,
         data,
         counter,
         &config.bench,
@@ -272,6 +277,7 @@ async fn run_sled(
     tokio::spawn(supervisor_gen_server.run());
 
     let blocks_pool = BytesPool::new();
+    let version_provider = ero_blockwheel_kv::version::Provider::from_unix_epoch_seed();
 
     let sled_tree = sled::Config::new()
         .path(&config.sled.directory)
@@ -294,6 +300,7 @@ async fn run_sled(
             database: Arc::new(sled_tree),
         },
         &blocks_pool,
+        &version_provider,
         data,
         counter,
         &config.bench,
@@ -343,6 +350,7 @@ async fn stress_loop(
     supervisor_pid: &mut SupervisorPid,
     mut backend: Backend,
     blocks_pool: &BytesPool,
+    version_provider: &ero_blockwheel_kv::version::Provider,
     data: &mut DataIndex,
     counter: &mut Counter,
     limits: &toml_config::Bench,
@@ -410,7 +418,7 @@ async fn stress_loop(
                     active_tasks_counter,
                 );
 
-                backend.spawn_insert_task(supervisor_pid, &done_tx, &blocks_pool, key_amount, value_amount, &limits);
+                backend.spawn_insert_task(supervisor_pid, &done_tx, &blocks_pool, &version_provider, key_amount, value_amount, &limits);
                 active_tasks_counter.inserts += 1;
             } else {
                 // remove task
@@ -437,7 +445,7 @@ async fn stress_loop(
                 );
 
                 let key = key.clone();
-                backend.spawn_remove_task(supervisor_pid, &done_tx, key, &limits);
+                backend.spawn_remove_task(supervisor_pid, &done_tx, &blocks_pool, &version_provider, key, &limits);
                 active_tasks_counter.removes += 1;
             }
         } else {
@@ -493,12 +501,26 @@ async fn stress_loop(
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+struct SledEntry<'a> {
+    version: u64,
+    #[serde(borrow)]
+    value: SledValue<'a>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum SledValue<'a> {
+    Value { data: &'a [u8], },
+    Tombstone,
+}
+
 impl Backend {
     fn spawn_insert_task(
         &mut self,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
+        version_provider: &ero_blockwheel_kv::version::Provider,
         key_amount: usize,
         value_amount: usize,
         limits: &toml_config::Bench,
@@ -545,6 +567,7 @@ impl Backend {
             Backend::Sled { database, } => {
                 let database = database.clone();
                 let blocks_pool = blocks_pool.clone();
+                let version_provider = version_provider.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let insert_task = tokio::task::spawn_blocking(move || {
@@ -559,16 +582,23 @@ impl Backend {
                         for _ in 0 .. value_amount {
                             value_block.push(rng.gen());
                         }
+                        let mut sled_value_block = blocks_pool.lend();
+                        let version = version_provider.obtain();
+                        bincode::serialize_into(&mut *sled_value_block, &SledEntry {
+                            version,
+                            value: SledValue::Value { data: &value_block, },
+                        }).map_err(Error::SledSerialize)?;
                         let key = kv::Key { key_bytes: key_block.freeze(), };
+                        database.insert(&**key.key_bytes, &**sled_value_block)
+                            .map_err(Error::InsertSled)?;
                         let value = kv::Value { value_bytes: value_block.freeze(), };
-                        database.insert(&**key.key_bytes, &**value.value_bytes)
-                            .map(|_| TaskDone::Insert { key, value, version: 0, })
+                        Ok(TaskDone::Insert { key, value, version, })
                     });
                     match tokio::time::timeout(op_timeout, insert_task).await {
                         Ok(Ok(Ok(task_done))) =>
                             Ok(task_done),
                         Ok(Ok(Err(error))) =>
-                            Err(Error::InsertSled(error)),
+                            Err(error),
                         Ok(Err(error)) =>
                             Err(Error::InsertTaskJoin(error)),
                         Err(..) =>
@@ -622,32 +652,35 @@ impl Backend {
                     });
                     match tokio::time::timeout(op_timeout, lookup_task).await {
                         Ok(Ok(Ok(None))) =>
-                            match value_cell.cell {
-                                kv::Cell::Value(..) =>
-                                    Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
-                                kv::Cell::Tombstone =>
+                            Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
+                        Ok(Ok(Ok(Some(bin)))) => {
+                            let sled_entry: SledEntry<'_> = bincode::deserialize(&bin)
+                                .map_err(Error::SledDeserialize)?;
+                            match sled_entry.value {
+                                SledValue::Value { data, } => {
+                                    let mut value_block = blocks_pool.lend();
+                                    value_block.extend_from_slice(data);
                                     Ok(TaskDone::Lookup {
                                         key,
                                         found_value_cell: kv::ValueCell {
-                                            version: 0,
+                                            version: sled_entry.version,
+                                            cell: kv::Cell::Value(value_block.into()),
+                                        },
+                                        version_snapshot,
+                                        lookup_kind: LookupKind::Single,
+                                    })
+                                },
+                                SledValue::Tombstone =>
+                                    Ok(TaskDone::Lookup {
+                                        key,
+                                        found_value_cell: kv::ValueCell {
+                                            version: sled_entry.version,
                                             cell: kv::Cell::Tombstone,
                                         },
                                         version_snapshot,
                                         lookup_kind: LookupKind::Single,
                                     }),
-                            },
-                        Ok(Ok(Ok(Some(found_value_bin)))) => {
-                            let mut value_block = blocks_pool.lend();
-                            value_block.extend_from_slice(&found_value_bin);
-                            Ok(TaskDone::Lookup {
-                                key,
-                                found_value_cell: kv::ValueCell {
-                                    version: 0,
-                                    cell: kv::Cell::Value(value_block.into()),
-                                },
-                                version_snapshot,
-                                lookup_kind: LookupKind::Single,
-                            })
+                            }
                         },
                         Ok(Ok(Err(error))) =>
                             Err(Error::LookupSled(error)),
@@ -735,26 +768,34 @@ impl Backend {
                         let mut iter = database.range(&**sled_key ..= &**sled_key);
                         let task_done = match iter.next() {
                             None =>
-                                TaskDone::Lookup {
-                                    key: key.clone(),
-                                    found_value_cell: kv::ValueCell {
-                                        version: 0,
-                                        cell: kv::Cell::Tombstone,
+                                return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
+                            Some(Ok((_found_key_bin, found_bin))) => {
+                                let sled_entry: SledEntry<'_> = bincode::deserialize(&found_bin)
+                                    .map_err(Error::SledDeserialize)?;
+                                match sled_entry.value {
+                                    SledValue::Value { data, } => {
+                                        let mut value_block = blocks_pool.lend();
+                                        value_block.extend_from_slice(data);
+                                        TaskDone::Lookup {
+                                            key: key.clone(),
+                                            found_value_cell: kv::ValueCell {
+                                                version: sled_entry.version,
+                                                cell: kv::Cell::Value(value_block.into()),
+                                            },
+                                            version_snapshot,
+                                            lookup_kind: LookupKind::Single,
+                                        }
                                     },
-                                    version_snapshot,
-                                    lookup_kind: LookupKind::Range,
-                                },
-                            Some(Ok((_found_key_bin, found_value_bin))) => {
-                                let mut value_block = blocks_pool.lend();
-                                value_block.extend_from_slice(&found_value_bin);
-                                TaskDone::Lookup {
-                                    key: key.clone(),
-                                    found_value_cell: kv::ValueCell {
-                                        version: 0,
-                                        cell: kv::Cell::Value(value_block.into()),
-                                    },
-                                    version_snapshot,
-                                    lookup_kind: LookupKind::Range,
+                                    SledValue::Tombstone =>
+                                        TaskDone::Lookup {
+                                            key: key.clone(),
+                                            found_value_cell: kv::ValueCell {
+                                                version: sled_entry.version,
+                                                cell: kv::Cell::Tombstone,
+                                            },
+                                            version_snapshot,
+                                            lookup_kind: LookupKind::Single,
+                                        },
                                 }
                             },
                             Some(Err(error)) =>
@@ -801,6 +842,8 @@ impl Backend {
         &mut self,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
+        version_provider: &ero_blockwheel_kv::version::Provider,
         key: kv::Key,
         limits: &toml_config::Bench,
     )
@@ -827,16 +870,24 @@ impl Backend {
             Backend::Sled { database, } => {
                 let database = database.clone();
                 let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
+                let blocks_pool = blocks_pool.clone();
+                let version_provider = version_provider.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    let sled_key = key.key_bytes.clone();
+                    let sled_key = key.clone();
                     let remove_task = tokio::task::spawn_blocking(move || {
-                        database.remove(&**sled_key)
+                        let mut sled_value_block = blocks_pool.lend();
+                        let version = version_provider.obtain();
+                        bincode::serialize_into(&mut *sled_value_block, &SledEntry {
+                            version,
+                            value: SledValue::Tombstone,
+                        }).map_err(Error::SledSerialize)?;
+                        database.insert(&**sled_key.key_bytes, &**sled_value_block)
+                            .map_err(Error::RemoveSled)
+                            .map(|_| TaskDone::Remove { key: sled_key, version, })
                     });
                     match tokio::time::timeout(op_timeout, remove_task).await {
-                        Ok(Ok(Ok(..))) =>
-                            Ok(TaskDone::Remove { key, version: 0, }),
-                        Ok(Ok(Err(error))) =>
-                            Err(Error::RemoveSled(error)),
+                        Ok(Ok(result)) =>
+                            result,
                         Ok(Err(error)) =>
                             Err(Error::RemoveTaskJoin(error)),
                         Err(..) =>
@@ -945,6 +996,7 @@ impl TaskDone {
                             key,
                             expected_value_cell: data.data[offset].value_cell.clone(),
                             found_value_cell,
+                            version_snapshot,
                         });
                     }
                 } else if version_found < version_current {
@@ -956,6 +1008,7 @@ impl TaskDone {
                             key,
                             expected_value_cell: data.data[offset].value_cell.clone(),
                             found_value_cell,
+                            version_snapshot,
                         });
                     }
                 } else {
@@ -985,8 +1038,6 @@ impl TaskDone {
                 data.current_version = version;
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
-
-                log::warn!("removed key: {:?}", key);
             },
         }
         Ok(())
