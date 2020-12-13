@@ -119,7 +119,6 @@ enum Error {
         key: kv::Key,
         expected_value_cell: kv::ValueCell,
         found_value_cell: kv::ValueCell,
-        version_snapshot: u64,
     },
     UnexpectedValueForLookupRange {
         key: kv::Key,
@@ -149,7 +148,6 @@ fn main() -> Result<(), Error> {
     let mut data = DataIndex {
         index: HashMap::new(),
         data: Vec::new(),
-        current_version: 0,
     };
     let mut counter = Counter::default();
 
@@ -334,7 +332,6 @@ impl Counter {
 struct DataIndex {
     index: HashMap<kv::Key, usize>,
     data: Vec<kv::KeyValuePair>,
-    current_version: u64,
 }
 
 #[derive(Clone)]
@@ -452,7 +449,6 @@ async fn stress_loop(
             // lookup task
             let key_index = rng.gen_range(0, data.data.len());
             let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
-            let version_snapshot = data.current_version;
 
             let lookup_kind = if rng.gen_range(0.0, 1.0) < 0.5 {
                 LookupKind::Single
@@ -480,11 +476,11 @@ async fn stress_loop(
 
             match lookup_kind {
                 LookupKind::Single => {
-                    backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, version_snapshot, &limits);
+                    backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, &limits);
                     active_tasks_counter.lookups += 1;
                 },
                 LookupKind::Range => {
-                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, version_snapshot, &limits);
+                    backend.spawn_lookup_range_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, &limits);
                     active_tasks_counter.lookups_range += 1;
                 },
             }
@@ -616,7 +612,6 @@ impl Backend {
         blocks_pool: &BytesPool,
         key: kv::Key,
         value_cell: kv::ValueCell,
-        version_snapshot: u64,
         limits: &toml_config::Bench,
     )
     {
@@ -633,7 +628,12 @@ impl Backend {
                         Ok(Ok(None)) =>
                             Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
                         Ok(Ok(Some(found_value_cell))) =>
-                            Ok(TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind: LookupKind::Single, }),
+                            Ok(TaskDone::Lookup {
+                                key,
+                                found_value_cell,
+                                version_snapshot: value_cell.version,
+                                lookup_kind: LookupKind::Single,
+                            }),
                         Ok(Err(error)) =>
                             Err(Error::Lookup(error)),
                         Err(..) =>
@@ -666,7 +666,7 @@ impl Backend {
                                             version: sled_entry.version,
                                             cell: kv::Cell::Value(value_block.into()),
                                         },
-                                        version_snapshot,
+                                        version_snapshot: value_cell.version,
                                         lookup_kind: LookupKind::Single,
                                     })
                                 },
@@ -677,7 +677,7 @@ impl Backend {
                                             version: sled_entry.version,
                                             cell: kv::Cell::Tombstone,
                                         },
-                                        version_snapshot,
+                                        version_snapshot: value_cell.version,
                                         lookup_kind: LookupKind::Single,
                                     }),
                             }
@@ -701,7 +701,6 @@ impl Backend {
         blocks_pool: &BytesPool,
         key: kv::Key,
         value_cell: kv::ValueCell,
-        version_snapshot: u64,
         limits: &toml_config::Bench,
     )
     {
@@ -731,7 +730,7 @@ impl Backend {
                             TaskDone::Lookup {
                                 key: key.clone(),
                                 found_value_cell: key_value_pair.value_cell,
-                                version_snapshot,
+                                version_snapshot: value_cell.version,
                                 lookup_kind: LookupKind::Range,
                             },
                         Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
@@ -782,7 +781,7 @@ impl Backend {
                                                 version: sled_entry.version,
                                                 cell: kv::Cell::Value(value_block.into()),
                                             },
-                                            version_snapshot,
+                                            version_snapshot: value_cell.version,
                                             lookup_kind: LookupKind::Single,
                                         }
                                     },
@@ -793,7 +792,7 @@ impl Backend {
                                                 version: sled_entry.version,
                                                 cell: kv::Cell::Tombstone,
                                             },
-                                            version_snapshot,
+                                            version_snapshot: value_cell.version,
                                             lookup_kind: LookupKind::Single,
                                         },
                                 }
@@ -964,21 +963,14 @@ impl TaskDone {
                         cell: kv::Cell::Value(value.clone()),
                     },
                 };
-                let updated = if let Some(&offset) = data.index.get(&key) {
+                if let Some(&offset) = data.index.get(&key) {
                     if data.data[offset].value_cell.version < data_cell.value_cell.version {
                         data.data[offset] = data_cell;
-                        true
-                    } else {
-                        false
                     }
                 } else {
                     let offset = data.data.len();
                     data.data.push(data_cell);
                     data.index.insert(key, offset);
-                    true
-                };
-                if updated {
-                    data.current_version = version;
                 }
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
@@ -996,23 +988,19 @@ impl TaskDone {
                             key,
                             expected_value_cell: data.data[offset].value_cell.clone(),
                             found_value_cell,
-                            version_snapshot,
                         });
                     }
-                } else if version_found < version_current {
-                    if version_snapshot < version_current {
-                        // deprecated lookup (ignoring)
-                    } else {
-                        // lookup started after value is actually updated, something wrong
-                        return Err(Error::UnexpectedValueFound {
-                            key,
-                            expected_value_cell: data.data[offset].value_cell.clone(),
-                            found_value_cell,
-                            version_snapshot,
-                        });
-                    }
+                } else if version_snapshot < version_current {
+                    // deprecated lookup (ignoring)
+                    log::warn!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
                 } else {
-                    unreachable!("key = {:?}, version_current = {}, version_found = {}", key, version_current, version_found);
+                    // premature lookup (ignoring, don't want to wait)
+                    log::warn!(
+                        "premature lookup: found version {} but current is still {} (awaiting {})",
+                        version_found,
+                        version_current,
+                        version_snapshot,
+                    );
                 }
                 match lookup_kind {
                     LookupKind::Single => {
@@ -1034,8 +1022,9 @@ impl TaskDone {
                     },
                 };
                 let &offset = data.index.get(&key).unwrap();
-                data.data[offset] = data_cell;
-                data.current_version = version;
+                if data.data[offset].value_cell.version < data_cell.value_cell.version {
+                    data.data[offset] = data_cell;
+                }
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
             },

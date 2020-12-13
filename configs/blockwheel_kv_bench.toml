@@ -55,7 +55,7 @@ db_size = 12288
 # maximum number of parallel kv access tasks
 active_tasks = 512
 # total number of actions with kv database
-actions = 24576
+actions = 1048576 # 24576
 # maximum key size in bytes
 key_size_bytes = 32
 # maximum value size in bytes
