@@ -35,7 +35,11 @@ use futures::{
     StreamExt,
 };
 
-use rand::Rng;
+use rand::{
+    Rng,
+    SeedableRng,
+    rngs::SmallRng,
+};
 
 use alloc_pool::{
     bytes::{
@@ -354,7 +358,7 @@ async fn stress_loop(
 )
     -> Result<(), Error>
 {
-    let mut rng = rand::thread_rng();
+    let mut rng = SmallRng::from_entropy();
     let (done_tx, done_rx) = mpsc::channel(0);
     pin_mut!(done_rx);
     let mut active_tasks_counter = Counter::default();
@@ -531,7 +535,7 @@ impl Backend {
                     let mut key_block = blocks_pool.lend();
                     let mut value_block = blocks_pool.lend();
                     let gen_task = tokio::task::spawn_blocking(move || {
-                        let mut rng = rand::thread_rng();
+                        let mut rng = SmallRng::from_entropy();
                         key_block.reserve(key_amount);
                         for _ in 0 .. key_amount {
                             key_block.push(rng.gen());
@@ -569,7 +573,7 @@ impl Backend {
                     let insert_task = tokio::task::spawn_blocking(move || {
                         let mut key_block = blocks_pool.lend();
                         let mut value_block = blocks_pool.lend();
-                        let mut rng = rand::thread_rng();
+                        let mut rng = SmallRng::from_entropy();
                         key_block.reserve(key_amount);
                         for _ in 0 .. key_amount {
                             key_block.push(rng.gen());
