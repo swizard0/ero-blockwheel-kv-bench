@@ -595,12 +595,12 @@ impl Backend {
                         }
                         let mut sled_value_block = blocks_pool.lend();
                         let version = version_provider.obtain();
-                        bincode::serialize_into(&mut *sled_value_block, &SledEntry {
+                        bincode::serialize_into(&mut **sled_value_block, &SledEntry {
                             version,
                             value: SledValue::Value { data: &value_block, },
                         }).map_err(Error::SledSerialize)?;
                         let key = kv::Key { key_bytes: key_block.freeze(), };
-                        database.insert(&**key.key_bytes, &**sled_value_block)
+                        database.insert(&**key.key_bytes, &***sled_value_block)
                             .map_err(Error::InsertSled)?;
                         let value = kv::Value { value_bytes: value_block.freeze(), };
                         Ok(TaskDone::Insert { key, value, version, })
@@ -891,11 +891,11 @@ impl Backend {
                     let remove_task = tokio::task::spawn_blocking(move || {
                         let mut sled_value_block = blocks_pool.lend();
                         let version = version_provider.obtain();
-                        bincode::serialize_into(&mut *sled_value_block, &SledEntry {
+                        bincode::serialize_into(&mut **sled_value_block, &SledEntry {
                             version,
                             value: SledValue::Tombstone,
                         }).map_err(Error::SledSerialize)?;
-                        database.insert(&**sled_key.key_bytes, &**sled_value_block)
+                        database.insert(&**sled_key.key_bytes, &***sled_value_block)
                             .map_err(Error::RemoveSled)
                             .map(|_| TaskDone::Remove { key: sled_key, version, })
                     });
