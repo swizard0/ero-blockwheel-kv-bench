@@ -39,6 +39,7 @@ use rand::{
     Rng,
     SeedableRng,
     rngs::SmallRng,
+    distributions::Uniform,
 };
 
 use alloc_pool::{
@@ -151,6 +152,7 @@ fn main() -> Result<(), Error> {
 
     let mut data = DataIndex {
         index: HashMap::new(),
+        alive: HashMap::new(),
         data: Vec::new(),
     };
     let mut counter = Counter::default();
@@ -335,6 +337,7 @@ impl Counter {
 
 struct DataIndex {
     index: HashMap<kv::Key, usize>,
+    alive: HashMap<kv::Key, usize>,
     data: Vec<kv::KeyValuePair>,
 }
 
@@ -359,6 +362,10 @@ async fn stress_loop(
     -> Result<(), Error>
 {
     let mut rng = SmallRng::from_entropy();
+    let p_distribution = Uniform::new(0.0, 1.0);
+    let key_distribution = Uniform::new(1, limits.key_size_bytes);
+    let value_distribution = Uniform::new(1, limits.value_size_bytes);
+
     let (done_tx, done_rx) = mpsc::channel(0);
     pin_mut!(done_rx);
     let mut active_tasks_counter = Counter::default();
@@ -399,14 +406,14 @@ async fn stress_loop(
         }
 
         // construct action and run task
-        if data.data.is_empty() || rng.gen_range(0.0, 1.0) < 0.5 {
+        if data.data.is_empty() || rng.sample(p_distribution) < 0.5 {
             // insert or remove task
-            let insert_prob = 1.0 - (data.data.len() as f64 / limits.db_size as f64);
-            let dice = rng.gen_range(0.0, 1.0);
-            if data.data.is_empty() || dice < insert_prob {
+            let insert_prob = 1.0 - (data.alive.len() as f64 / limits.db_size as f64);
+            let dice = rng.sample(p_distribution);
+            if data.alive.is_empty() || dice < insert_prob {
                 // insert task
-                let key_amount = rng.gen_range(1, limits.key_size_bytes);
-                let value_amount = rng.gen_range(1, limits.value_size_bytes);
+                let key_amount = rng.sample(key_distribution);
+                let value_amount = rng.sample(value_distribution);
 
                 log::debug!(
                     "{}. performing INSERT with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
@@ -424,7 +431,11 @@ async fn stress_loop(
             } else {
                 // remove task
                 let (key, value) = loop {
-                    let key_index = rng.gen_range(0, data.data.len());
+                    let index = rng.gen_range(0, data.alive.len());
+                    let &key_index = data.alive
+                        .values()
+                        .nth(index)
+                        .unwrap();
                     let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
                     match &value_cell.cell {
                         kv::Cell::Value(value) =>
@@ -454,7 +465,7 @@ async fn stress_loop(
             let key_index = rng.gen_range(0, data.data.len());
             let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
 
-            let lookup_kind = if rng.gen_range(0.0, 1.0) < 0.5 {
+            let lookup_kind = if rng.sample(p_distribution) < 0.5 {
                 LookupKind::Single
             } else {
                 LookupKind::Range
@@ -786,7 +797,7 @@ impl Backend {
                                                 cell: kv::Cell::Value(value_block.into()),
                                             },
                                             version_snapshot: value_cell.version,
-                                            lookup_kind: LookupKind::Single,
+                                            lookup_kind: LookupKind::Range,
                                         }
                                     },
                                     SledValue::Tombstone =>
@@ -797,7 +808,7 @@ impl Backend {
                                                 cell: kv::Cell::Tombstone,
                                             },
                                             version_snapshot: value_cell.version,
-                                            lookup_kind: LookupKind::Single,
+                                            lookup_kind: LookupKind::Range,
                                         },
                                 }
                             },
@@ -970,11 +981,13 @@ impl TaskDone {
                 if let Some(&offset) = data.index.get(&key) {
                     if data.data[offset].value_cell.version < data_cell.value_cell.version {
                         data.data[offset] = data_cell;
+                        data.alive.insert(key.clone(), offset);
                     }
                 } else {
                     let offset = data.data.len();
                     data.data.push(data_cell);
-                    data.index.insert(key, offset);
+                    data.index.insert(key.clone(), offset);
+                    data.alive.insert(key, offset);
                 }
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
@@ -1028,6 +1041,7 @@ impl TaskDone {
                 let &offset = data.index.get(&key).unwrap();
                 if data.data[offset].value_cell.version < data_cell.value_cell.version {
                     data.data[offset] = data_cell;
+                    data.alive.remove(&key);
                 }
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
