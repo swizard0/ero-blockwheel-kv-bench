@@ -25,7 +25,7 @@ task_restart_sec = 1
 # backend file for blockwheel fs
 wheel_filename = "blockwheel_kv.blocks"
 # initial size for backend file in case of creating new for blockwheel fs
-init_wheel_size_bytes = 134217728
+init_wheel_size_bytes = 1073741824
 # main wheel task restart timeout (in seconds) for blockwheel fs
 wheel_task_restart_sec = 4
 # tasks pool limit for main wheel task in blockwheel fs
@@ -33,7 +33,7 @@ wheel_task_tasks_limit = 64
 # work block size for fs ops in blockwheel fs
 work_block_size_bytes = 8388608
 # LRU cache maximum size (in bytes) in blockwheel fs
-lru_cache_size_bytes = 1048576
+lru_cache_size_bytes = 8388608
 # maximum number of simultaneously running defragmentation tasks in blockwheel fs
 defrag_parallel_tasks_limit = 4
 
