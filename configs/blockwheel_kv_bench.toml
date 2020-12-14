@@ -3,7 +3,7 @@
 # blockwheel_kv key-value database related parameters
 [blockwheel_kv]
 # blockwheel kv storage n-tree block size
-tree_block_size = 256
+tree_block_size = 192
 # butcher task restart timeout (seconds) for blockwheel kv storage
 butcher_task_restart_sec = 1
 # manager task restart timeout (seconds) for blockwheel kv storage
@@ -61,12 +61,12 @@ key_size_bytes = 32
 # maximum value size in bytes
 value_size_bytes = 4096
 # db insert operation timeout (in seconds)
-timeout_insert_secs = 40
+timeout_insert_secs = 60
 # db lookup operation timeout (in seconds)
-timeout_lookup_secs = 60
+timeout_lookup_secs = 120
 # db lookup range operation timeout (in seconds)
-timeout_lookup_range_secs = 60
+timeout_lookup_range_secs = 120
 # db remove operation timeout (in seconds)
-timeout_remove_secs = 40
+timeout_remove_secs = 60
 # db flush operation timeout (in seconds)
-timeout_flush_secs = 360
+timeout_flush_secs = 600
