@@ -136,6 +136,7 @@ enum Error {
     WheelsGoneDuringFlush,
     SledSerialize(bincode::Error),
     SledDeserialize(bincode::Error),
+    WheelGoneDuringInfo { blockwheel_filename: ero_blockwheel_kv::wheels::WheelFilename, },
 }
 
 fn main() -> Result<(), Error> {
@@ -229,7 +230,7 @@ async fn run_blockwheel_kv(
 
     supervisor_pid.spawn_link_permanent(
         wheels_gen_server.run(
-            wheel_refs,
+            wheel_refs.clone(),
             ero_blockwheel_kv::wheels::Params {
                 task_restart_sec: config.blockwheel_wheels.task_restart_sec,
             },
@@ -268,6 +269,12 @@ async fn run_blockwheel_kv(
         counter,
         &config.bench,
     ).await?;
+
+    for ero_blockwheel_kv::wheels::WheelRef { blockwheel_filename, mut blockwheel_pid, } in wheel_refs {
+        let info = blockwheel_pid.info().await
+            .map_err(|ero::NoProcError| Error::WheelGoneDuringInfo { blockwheel_filename: blockwheel_filename.clone(), })?;
+        log::info!("{:?} | {:?}", blockwheel_filename, info);
+    }
 
     Ok(())
 }
