@@ -26,7 +26,7 @@ task_restart_sec = 1
 wheel_filename = "blockwheel_kv.blocks"
 # initial size for backend file in case of creating new for blockwheel fs
 # init_wheel_size_bytes = 1073741824
-init_wheel_size_bytes = 2147483648
+init_wheel_size_bytes = 1610612736
 # main wheel task restart timeout (in seconds) for blockwheel fs
 wheel_task_restart_sec = 4
 # tasks pool limit for main wheel task in blockwheel fs
@@ -61,12 +61,12 @@ key_size_bytes = 32
 # maximum value size in bytes
 value_size_bytes = 4096
 # db insert operation timeout (in seconds)
-timeout_insert_secs = 30
+timeout_insert_secs = 40
 # db lookup operation timeout (in seconds)
 timeout_lookup_secs = 60
 # db lookup range operation timeout (in seconds)
 timeout_lookup_range_secs = 60
 # db remove operation timeout (in seconds)
-timeout_remove_secs = 30
+timeout_remove_secs = 40
 # db flush operation timeout (in seconds)
 timeout_flush_secs = 360
