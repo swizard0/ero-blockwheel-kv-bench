@@ -509,9 +509,11 @@ async fn stress_loop(
 
     assert!(done_rx.next().await.is_none());
 
+    log::info!("FINISHED main bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
+
     backend.flush(&limits).await?;
 
-    log::info!("FINISHED bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
+    log::info!("FINISHED db flush: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
 
     Ok(())
 }

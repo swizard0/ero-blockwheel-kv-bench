@@ -3,7 +3,7 @@
 # blockwheel_kv key-value database related parameters
 [blockwheel_kv]
 # blockwheel kv storage n-tree block size
-tree_block_size = 32
+tree_block_size = 256
 # butcher task restart timeout (seconds) for blockwheel kv storage
 butcher_task_restart_sec = 1
 # manager task restart timeout (seconds) for blockwheel kv storage
