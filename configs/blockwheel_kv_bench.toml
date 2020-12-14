@@ -42,7 +42,7 @@ defrag_parallel_tasks_limit = 4
 # the path of the database
 directory = "database.sled"
 # maximum size in bytes for the system page cache
-cache_capacity = 1073741824
+cache_capacity = 16777216 # set lower to force disk access
 # specify whether the system should run in \"small\" or \"fast\" mode
 mode = "fast"
 # print a performance profile when the Config is dropped
@@ -53,7 +53,7 @@ print_profile_on_drop = true
 # average number of entries in database to keep
 db_size = 524288 # 12288
 # maximum number of parallel kv access tasks
-active_tasks = 512
+active_tasks = 2048
 # total number of actions with kv database
 actions = 1048576 # 24576
 # maximum key size in bytes
@@ -69,4 +69,4 @@ timeout_lookup_range_secs = 30
 # db remove operation timeout (in seconds)
 timeout_remove_secs = 30
 # db flush operation timeout (in seconds)
-timeout_flush_secs = 60
+timeout_flush_secs = 360
