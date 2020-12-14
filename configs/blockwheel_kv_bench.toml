@@ -53,7 +53,7 @@ print_profile_on_drop = true
 # average number of entries in database to keep
 db_size = 524288 # 12288
 # maximum number of parallel kv access tasks
-active_tasks = 2048
+active_tasks = 3072
 # total number of actions with kv database
 actions = 1048576 # 24576
 # maximum key size in bytes
