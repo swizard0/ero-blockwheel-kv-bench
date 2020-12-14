@@ -63,9 +63,9 @@ value_size_bytes = 4096
 # db insert operation timeout (in seconds)
 timeout_insert_secs = 30
 # db lookup operation timeout (in seconds)
-timeout_lookup_secs = 30
+timeout_lookup_secs = 60
 # db lookup range operation timeout (in seconds)
-timeout_lookup_range_secs = 30
+timeout_lookup_range_secs = 60
 # db remove operation timeout (in seconds)
 timeout_remove_secs = 30
 # db flush operation timeout (in seconds)
