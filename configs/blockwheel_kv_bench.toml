@@ -50,12 +50,11 @@ print_profile_on_drop = true
 
 # bench related parameter
 [bench]
-# average number of entries in database to keep
-db_size = 524288 # 12288
 # maximum number of parallel kv access tasks
 active_tasks = 3072
 # total number of actions with kv database
-actions = 1048576 # 24576
+# actions = 131072
+actions = 1048576
 # maximum key size in bytes
 key_size_bytes = 32
 # maximum value size in bytes

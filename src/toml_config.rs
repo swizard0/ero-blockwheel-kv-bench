@@ -41,7 +41,6 @@ pub struct Sled {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct Bench {
-    pub db_size: usize,
     pub active_tasks: usize,
     pub actions: usize,
     pub key_size_bytes: usize,

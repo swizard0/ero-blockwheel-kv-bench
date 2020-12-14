@@ -113,6 +113,9 @@ enum Error {
     InsertTimedOutNoKey,
     LookupTimedOut { key: kv::Key, value_cell: kv::ValueCell, },
     LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
+    LookupRangeTimedOutInit { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
+    LookupRangeTimedOutFirst { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
+    LookupRangeTimedOutLast { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
     RemoveTimedOut { key: kv::Key, },
     FlushTimedOut,
     ExpectedValueNotFound {
@@ -408,7 +411,8 @@ async fn stress_loop(
         // construct action and run task
         if data.data.is_empty() || rng.sample(p_distribution) < 0.5 {
             // insert or remove task
-            let insert_prob = 1.0 - (data.alive.len() as f64 / limits.db_size as f64);
+            let db_size = limits.actions / 2;
+            let insert_prob = 1.0 - (data.alive.len() as f64 / db_size as f64);
             let dice = rng.sample(p_distribution);
             if data.alive.is_empty() || dice < insert_prob {
                 // insert task
@@ -732,7 +736,7 @@ impl Backend {
                         Ok(result) =>
                             result.map_err(Error::LookupRange)?,
                         Err(..) =>
-                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, value_cell, }),
+                            return Err(Error::LookupRangeTimedOutInit { key_from: key.clone(), key_to: key, value_cell, }),
                     };
                     let lookup_range_next_task = tokio::time::timeout(
                         op_timeout,
@@ -751,7 +755,7 @@ impl Backend {
                         Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
                             return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
                         Err(..) =>
-                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, value_cell, }),
+                            return Err(Error::LookupRangeTimedOutFirst { key_from: key.clone(), key_to: key, value_cell, }),
                     };
                     let lookup_range_next_task = tokio::time::timeout(
                         op_timeout,
@@ -765,7 +769,7 @@ impl Backend {
                         Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
                             (),
                         Err(..) =>
-                            return Err(Error::LookupRangeTimedOut { key_from: key.clone(), key_to: key, value_cell, }),
+                            return Err(Error::LookupRangeTimedOutLast { key_from: key.clone(), key_to: key, value_cell, }),
                     }
                     assert!(lookup_range.key_values_rx.next().await.is_none());
                     Ok(result)
