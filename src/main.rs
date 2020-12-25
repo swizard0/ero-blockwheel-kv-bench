@@ -613,7 +613,7 @@ impl Backend {
                             value: SledValue::Value { data: &value_block, },
                         }).map_err(Error::SledSerialize)?;
                         let key = kv::Key { key_bytes: key_block.freeze(), };
-                        database.insert(&**key.key_bytes, &***sled_value_block)
+                        database.insert(&*key.key_bytes, &***sled_value_block)
                             .map_err(Error::InsertSled)?;
                         let value = kv::Value { value_bytes: value_block.freeze(), };
                         Ok(TaskDone::Insert { key, value, version, })
@@ -676,7 +676,7 @@ impl Backend {
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let sled_key = key.key_bytes.clone();
                     let lookup_task = tokio::task::spawn_blocking(move || {
-                        database.get(&**sled_key)
+                        database.get(&*sled_key)
                     });
                     match tokio::time::timeout(op_timeout, lookup_task).await {
                         Ok(Ok(Ok(None))) =>
@@ -793,7 +793,7 @@ impl Backend {
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let sled_key = key.key_bytes.clone();
                     let lookup_range_task = tokio::task::spawn_blocking(move || {
-                        let mut iter = database.range(&**sled_key ..= &**sled_key);
+                        let mut iter = database.range(&*sled_key ..= &*sled_key);
                         let task_done = match iter.next() {
                             None =>
                                 return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
@@ -913,7 +913,7 @@ impl Backend {
                             version,
                             value: SledValue::Tombstone,
                         }).map_err(Error::SledSerialize)?;
-                        database.insert(&**sled_key.key_bytes, &***sled_value_block)
+                        database.insert(&*sled_key.key_bytes, &***sled_value_block)
                             .map_err(Error::RemoveSled)
                             .map(|_| TaskDone::Remove { key: sled_key, version, })
                     });
