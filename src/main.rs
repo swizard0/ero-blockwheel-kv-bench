@@ -93,6 +93,7 @@ enum Error {
     ConfigParse(toml::de::Error),
     SledInvalidMode { mode_provided: String, },
     TokioRuntime(io::Error),
+    ThreadPool(rayon::ThreadPoolBuildError),
     Sled(sled::Error),
     GenTaskJoin(tokio::task::JoinError),
     Insert(ero_blockwheel_kv::InsertError),
@@ -188,6 +189,10 @@ async fn run_blockwheel_kv(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .build()
+        .map_err(Error::ThreadPool)?;
+    let thread_pool = Arc::new(thread_pool);
     let blocks_pool = BytesPool::new();
     let version_provider = ero_blockwheel_kv::version::Provider::from_unix_epoch_seed();
 
@@ -198,7 +203,6 @@ async fn run_blockwheel_kv(
             wheel_filename: fs_config.wheel_filename,
             init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
             wheel_task_restart_sec: fs_config.wheel_task_restart_sec,
-            wheel_task_tasks_limit: fs_config.wheel_task_tasks_limit,
             work_block_size_bytes: fs_config.work_block_size_bytes,
             lru_cache_size_bytes: fs_config.lru_cache_size_bytes,
             defrag_parallel_tasks_limit: fs_config.defrag_parallel_tasks_limit,
@@ -219,6 +223,7 @@ async fn run_blockwheel_kv(
         supervisor_pid.spawn_link_permanent(
             blockwheel_fs_gen_server.run(
                 supervisor_pid.clone(),
+                thread_pool.clone(),
                 blocks_pool.clone(),
                 blockwheel_fs_params,
             ),
@@ -243,6 +248,7 @@ async fn run_blockwheel_kv(
     supervisor_pid.spawn_link_permanent(
         blockwheel_kv_gen_server.run(
             supervisor_pid.clone(),
+            thread_pool.clone(),
             blocks_pool.clone(),
             version_provider.clone(),
             wheels_pid.clone(),

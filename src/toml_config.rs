@@ -25,7 +25,6 @@ pub struct BlockwheelFs {
     pub wheel_filename: PathBuf,
     pub init_wheel_size_bytes: usize,
     pub wheel_task_restart_sec: usize,
-    pub wheel_task_tasks_limit: usize,
     pub work_block_size_bytes: usize,
     pub lru_cache_size_bytes: usize,
     pub defrag_parallel_tasks_limit: usize,
