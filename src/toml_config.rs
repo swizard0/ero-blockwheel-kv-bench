@@ -50,3 +50,11 @@ pub struct Bench {
     pub timeout_remove_secs: u64,
     pub timeout_flush_secs: u64,
 }
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct Runtime {
+    pub worker_threads: usize,
+    pub max_blocking_threads: usize,
+    pub thread_stack_size: usize,
+    pub thread_keep_alive_ms: usize,
+}

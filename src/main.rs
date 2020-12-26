@@ -85,6 +85,7 @@ struct Config {
     blockwheel_wheels: toml_config::BlockwheelWheels,
     sled: toml_config::Sled,
     bench: toml_config::Bench,
+    runtime: toml_config::Runtime,
 }
 
 #[derive(Debug)]
@@ -152,6 +153,10 @@ fn main() -> Result<(), Error> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(config.runtime.worker_threads)
+        .max_blocking_threads(config.runtime.max_blocking_threads)
+        .thread_stack_size(config.runtime.thread_stack_size)
+        .thread_keep_alive(Duration::from_millis(config.runtime.thread_keep_alive_ms as u64))
         .build()
         .map_err(Error::TokioRuntime)?;
 

@@ -3,7 +3,7 @@
 # blockwheel_kv key-value database related parameters
 [blockwheel_kv]
 # blockwheel kv storage n-tree block size
-tree_block_size = 192
+tree_block_size = 1536
 # butcher task restart timeout (seconds) for blockwheel kv storage
 butcher_task_restart_sec = 1
 # manager task restart timeout (seconds) for blockwheel kv storage
@@ -21,6 +21,7 @@ search_tree_iter_send_buffer = 4
 task_restart_sec = 1
 
 # actual storage areas list related parameters
+
 [[blockwheel_wheels.fss]]
 # backend file for blockwheel fs
 wheel_filename = "blockwheel_kv.blocks"
@@ -29,14 +30,12 @@ wheel_filename = "blockwheel_kv.blocks"
 init_wheel_size_bytes = 1610612736
 # main wheel task restart timeout (in seconds) for blockwheel fs
 wheel_task_restart_sec = 4
-# tasks pool limit for main wheel task in blockwheel fs
-wheel_task_tasks_limit = 64
 # work block size for fs ops in blockwheel fs
 work_block_size_bytes = 8388608
 # LRU cache maximum size (in bytes) in blockwheel fs
 lru_cache_size_bytes = 8388608
 # maximum number of simultaneously running defragmentation tasks in blockwheel fs
-defrag_parallel_tasks_limit = 16
+defrag_parallel_tasks_limit = 8
 
 # sled key-value database related parameters
 [sled]
@@ -44,12 +43,12 @@ defrag_parallel_tasks_limit = 16
 directory = "database.sled"
 # maximum size in bytes for the system page cache
 cache_capacity = 16777216 # set lower to force disk access
-# specify whether the system should run in \"small\" or \"fast\" mode
+# specify whether the system should run in "small" or "fast" mode
 mode = "fast"
 # print a performance profile when the Config is dropped
 print_profile_on_drop = true
 
-# bench related parameter
+# bench related parameters
 [bench]
 # maximum number of parallel kv access tasks
 active_tasks = 3072
@@ -61,12 +60,23 @@ key_size_bytes = 32
 # maximum value size in bytes
 value_size_bytes = 4096
 # db insert operation timeout (in seconds)
-timeout_insert_secs = 60
+timeout_insert_secs = 120
 # db lookup operation timeout (in seconds)
-timeout_lookup_secs = 120
+timeout_lookup_secs = 240
 # db lookup range operation timeout (in seconds)
-timeout_lookup_range_secs = 120
+timeout_lookup_range_secs = 240
 # db remove operation timeout (in seconds)
-timeout_remove_secs = 60
+timeout_remove_secs = 120
 # db flush operation timeout (in seconds)
-timeout_flush_secs = 600
+timeout_flush_secs = 2400
+
+# tokio runtime related parameters
+[runtime]
+# sets the number of worker threads the runtime will use
+worker_threads = 4
+# specifies limit for threads, spawned by the runtime
+max_blocking_threads = 64
+# sets the stack size (in bytes) for worker threads
+thread_stack_size = 1073741824
+# sets a custom timeout for a thread in the blocking pool (in milliseconds)
+thread_keep_alive_ms = 10000
