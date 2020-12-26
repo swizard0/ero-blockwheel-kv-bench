@@ -86,6 +86,7 @@ struct Config {
     sled: toml_config::Sled,
     bench: toml_config::Bench,
     runtime: toml_config::Runtime,
+    rayon: toml_config::Rayon,
 }
 
 #[derive(Debug)]
@@ -195,6 +196,7 @@ async fn run_blockwheel_kv(
     tokio::spawn(supervisor_gen_server.run());
 
     let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.rayon.num_threads)
         .build()
         .map_err(Error::ThreadPool)?;
     let thread_pool = Arc::new(thread_pool);

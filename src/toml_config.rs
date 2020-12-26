@@ -58,3 +58,8 @@ pub struct Runtime {
     pub thread_stack_size: usize,
     pub thread_keep_alive_ms: usize,
 }
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct Rayon {
+    pub num_threads: usize,
+}
