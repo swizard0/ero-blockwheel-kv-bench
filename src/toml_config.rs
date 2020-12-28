@@ -60,6 +60,6 @@ pub struct Runtime {
 }
 
 #[derive(Clone, Deserialize, Debug)]
-pub struct Rayon {
-    pub num_threads: usize,
+pub struct Edeltraud {
+    pub worker_threads: usize,
 }

@@ -81,7 +81,7 @@ thread_stack_size = 1073741824
 # sets a custom timeout for a thread in the blocking pool (in milliseconds)
 thread_keep_alive_ms = 10000
 
-# rayon thread pool related parameters
-[rayon]
-# sets the number of threads to be used in the rayon threadpool
-num_threads = 4
+# edeltraud thread pool related parameters
+[edeltraud]
+# sets the number of threads to be used in the edeltraud threadpool
+worker_threads = 4

@@ -57,6 +57,7 @@ use ero::{
 
 use ero_blockwheel_kv::{
     kv,
+    job,
 };
 
 mod toml_config;
@@ -86,7 +87,7 @@ struct Config {
     sled: toml_config::Sled,
     bench: toml_config::Bench,
     runtime: toml_config::Runtime,
-    rayon: toml_config::Rayon,
+    edeltraud: toml_config::Edeltraud,
 }
 
 #[derive(Debug)]
@@ -95,7 +96,7 @@ enum Error {
     ConfigParse(toml::de::Error),
     SledInvalidMode { mode_provided: String, },
     TokioRuntime(io::Error),
-    ThreadPool(rayon::ThreadPoolBuildError),
+    ThreadPool(edeltraud::BuildError),
     Sled(sled::Error),
     GenTaskJoin(tokio::task::JoinError),
     Insert(ero_blockwheel_kv::InsertError),
@@ -195,11 +196,10 @@ async fn run_blockwheel_kv(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
-    let thread_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.rayon.num_threads)
+    let thread_pool: edeltraud::Edeltraud<job::Job> = edeltraud::Builder::new()
+        .worker_threads(config.edeltraud.worker_threads)
         .build()
         .map_err(Error::ThreadPool)?;
-    let thread_pool = Arc::new(thread_pool);
     let blocks_pool = BytesPool::new();
     let version_provider = ero_blockwheel_kv::version::Provider::from_unix_epoch_seed();
 
