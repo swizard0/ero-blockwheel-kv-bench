@@ -14,6 +14,8 @@ search_tree_task_restart_sec = 1
 search_tree_remove_tasks_limit = 64
 # mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
 search_tree_iter_send_buffer = 4
+# maximum entry value size to store with the key, values with greater size will be stored in separate blocks
+search_tree_values_inline_size_limit = 128
 
 # storage areas manager related parameters
 [blockwheel_wheels]

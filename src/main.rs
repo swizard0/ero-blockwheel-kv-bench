@@ -115,26 +115,26 @@ enum Error {
     FlushSled(sled::Error),
     InsertTimedOut { key: kv::Key, },
     InsertTimedOutNoKey,
-    LookupTimedOut { key: kv::Key, value_cell: kv::ValueCell, },
-    LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
-    LookupRangeTimedOutInit { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
-    LookupRangeTimedOutFirst { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
-    LookupRangeTimedOutLast { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell, },
+    LookupTimedOut { key: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
+    LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
+    LookupRangeTimedOutInit { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
+    LookupRangeTimedOutFirst { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
+    LookupRangeTimedOutLast { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
     RemoveTimedOut { key: kv::Key, },
     FlushTimedOut,
     ExpectedValueNotFound {
         key: kv::Key,
-        value_cell: kv::ValueCell,
+        value_cell: kv::ValueCell<kv::Value>,
         lookup_kind: LookupKind,
     },
     UnexpectedValueFound {
         key: kv::Key,
-        expected_value_cell: kv::ValueCell,
-        found_value_cell: kv::ValueCell,
+        expected_value_cell: kv::ValueCell<kv::Value>,
+        found_value_cell: kv::ValueCell<kv::Value>,
     },
     UnexpectedValueForLookupRange {
         key: kv::Key,
-        key_value_pair: kv::KeyValuePair,
+        key_value_pair: kv::KeyValuePair<kv::Value>,
     },
     UnexpectedLookupRangeRxFinish,
     WheelsGoneDuringFlush,
@@ -220,10 +220,10 @@ async fn run_blockwheel_kv(
 
         db_files.push(blockwheel_fs_params.wheel_filename.clone());
         wheel_refs.push(ero_blockwheel_kv::wheels::WheelRef {
-            blockwheel_filename: blockwheel_fs_params
-                .wheel_filename
-                .clone()
-                .into(),
+            blockwheel_filename: ero_blockwheel_kv::wheels::WheelFilename::from_path(
+                &blockwheel_fs_params.wheel_filename,
+                &blocks_pool,
+            ),
             blockwheel_pid: blockwheel_fs_pid,
         });
 
@@ -266,6 +266,7 @@ async fn run_blockwheel_kv(
                 search_tree_task_restart_sec: config.blockwheel_kv.search_tree_task_restart_sec,
                 search_tree_remove_tasks_limit: config.blockwheel_kv.search_tree_remove_tasks_limit,
                 search_tree_iter_send_buffer: config.blockwheel_kv.search_tree_iter_send_buffer,
+                search_tree_values_inline_size_limit: config.blockwheel_kv.search_tree_values_inline_size_limit,
             },
         ),
     );
@@ -361,7 +362,7 @@ impl Counter {
 struct DataIndex {
     index: HashMap<kv::Key, usize>,
     alive: HashMap<kv::Key, usize>,
-    data: Vec<kv::KeyValuePair>,
+    data: Vec<kv::KeyValuePair<kv::Value>>,
 }
 
 #[derive(Clone)]
@@ -652,7 +653,7 @@ impl Backend {
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
         key: kv::Key,
-        value_cell: kv::ValueCell,
+        value_cell: kv::ValueCell<kv::Value>,
         limits: &toml_config::Bench,
     )
     {
@@ -741,7 +742,7 @@ impl Backend {
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
         key: kv::Key,
-        value_cell: kv::ValueCell,
+        value_cell: kv::ValueCell<kv::Value>,
         limits: &toml_config::Bench,
     )
     {
@@ -977,7 +978,7 @@ impl Backend {
 }
 
 enum TaskDone {
-    Lookup { key: kv::Key, found_value_cell: kv::ValueCell, version_snapshot: u64, lookup_kind: LookupKind, },
+    Lookup { key: kv::Key, found_value_cell: kv::ValueCell<kv::Value>, version_snapshot: u64, lookup_kind: LookupKind, },
     Insert { key: kv::Key, value: kv::Value, version: u64, },
     Remove { key: kv::Key, version: u64, },
 }
