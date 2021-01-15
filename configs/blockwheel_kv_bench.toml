@@ -29,7 +29,7 @@ task_restart_sec = 1
 wheel_filename = "blockwheel_kv.blocks"
 # initial size for backend file in case of creating new for blockwheel fs
 # init_wheel_size_bytes = 1073741824
-init_wheel_size_bytes = 1610612736
+init_wheel_size_bytes = 2147483648
 # main wheel task restart timeout (in seconds) for blockwheel fs
 wheel_task_restart_sec = 4
 # work block size for fs ops in blockwheel fs
