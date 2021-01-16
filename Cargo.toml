@@ -1,6 +1,6 @@
 [package]
 name = "ero-blockwheel-kv-bench"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Benchmark utility for key/value persistent store `ero-blockwheel-kv`."
 edition = "2018"
@@ -8,7 +8,7 @@ edition = "2018"
 [dependencies]
 ero = { git = "https://github.com/swizard0/ero.git" }
 ero-blockwheel-fs = { git = "https://github.com/swizard0/ero-blockwheel-fs.git" }
-ero-blockwheel-kv = { git = "https://github.com/swizard0/ero-blockwheel-kv.git" }
+ero-blockwheel-kv = { git = "https://github.com/swizard0/ero-blockwheel-kv.git", branch = "futuresunordered_to_spawn" }
 alloc-pool = { git = "https://github.com/swizard0/alloc-pool.git" }
 edeltraud = { git = "https://github.com/swizard0/edeltraud.git" }
 
