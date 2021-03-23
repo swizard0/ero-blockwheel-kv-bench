@@ -23,12 +23,21 @@ pub struct BlockwheelWheels {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct BlockwheelFs {
+    pub interpreter: BlockwheelInterpreter,
     pub wheel_filename: PathBuf,
     pub init_wheel_size_bytes: usize,
     pub wheel_task_restart_sec: usize,
     pub work_block_size_bytes: usize,
     pub lru_cache_size_bytes: usize,
     pub defrag_parallel_tasks_limit: usize,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub enum BlockwheelInterpreter {
+    #[serde(rename = "fixed_file")]
+    FixedFile,
+    #[serde(rename = "ram")]
+    Ram,
 }
 
 #[derive(Clone, Deserialize, Debug)]

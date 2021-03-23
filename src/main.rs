@@ -39,6 +39,7 @@ use rand::{
     Rng,
     SeedableRng,
     rngs::SmallRng,
+    seq::IteratorRandom,
     distributions::Uniform,
 };
 
@@ -207,8 +208,17 @@ async fn run_blockwheel_kv(
     let mut wheel_refs = Vec::new();
     for fs_config in config.blockwheel_wheels.fss {
         let blockwheel_fs_params = ero_blockwheel_fs::Params {
-            wheel_filename: fs_config.wheel_filename,
-            init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+            interpreter: match fs_config.interpreter {
+                toml_config::BlockwheelInterpreter::FixedFile =>
+                    ero_blockwheel_fs::InterpreterParams::FixedFile(ero_blockwheel_fs::FixedFileInterpreterParams {
+                        wheel_filename: fs_config.wheel_filename,
+                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                    }),
+                toml_config::BlockwheelInterpreter::Ram =>
+                    ero_blockwheel_fs::InterpreterParams::Ram(ero_blockwheel_fs::RamInterpreterParams {
+                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                    }),
+            },
             wheel_task_restart_sec: fs_config.wheel_task_restart_sec,
             work_block_size_bytes: fs_config.work_block_size_bytes,
             lru_cache_size_bytes: fs_config.lru_cache_size_bytes,
@@ -218,10 +228,22 @@ async fn run_blockwheel_kv(
         let blockwheel_fs_gen_server = ero_blockwheel_fs::GenServer::new();
         let blockwheel_fs_pid = blockwheel_fs_gen_server.pid();
 
-        db_files.push(blockwheel_fs_params.wheel_filename.clone());
+        let blockwheel_filename = match &blockwheel_fs_params.interpreter {
+            ero_blockwheel_fs::InterpreterParams::FixedFile(interpreter_params) =>
+                interpreter_params.wheel_filename.clone(),
+            ero_blockwheel_fs::InterpreterParams::Ram(..) => {
+                ('a' ..= 'z')
+                    .choose_multiple(&mut rand::thread_rng(), 16)
+                    .into_iter()
+                    .collect::<String>()
+                    .into()
+            },
+        };
+
+        db_files.push(blockwheel_filename.clone());
         wheel_refs.push(ero_blockwheel_kv::wheels::WheelRef {
             blockwheel_filename: ero_blockwheel_kv::wheels::WheelFilename::from_path(
-                &blockwheel_fs_params.wheel_filename,
+                blockwheel_filename,
                 &blocks_pool,
             ),
             blockwheel_pid: blockwheel_fs_pid,
@@ -456,7 +478,7 @@ async fn stress_loop(
             } else {
                 // remove task
                 let (key, value) = loop {
-                    let index = rng.gen_range(0, data.alive.len());
+                    let index = rng.gen_range(0 .. data.alive.len());
                     let &key_index = data.alive
                         .values()
                         .nth(index)
@@ -487,7 +509,7 @@ async fn stress_loop(
             }
         } else {
             // lookup task
-            let key_index = rng.gen_range(0, data.data.len());
+            let key_index = rng.gen_range(0 .. data.data.len());
             let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
 
             let lookup_kind = if rng.sample(p_distribution) < 0.5 {
