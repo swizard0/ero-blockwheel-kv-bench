@@ -8,7 +8,7 @@ edition = "2018"
 [dependencies]
 ero = { git = "https://github.com/swizard0/ero.git" }
 ero-blockwheel-fs = { git = "https://github.com/swizard0/ero-blockwheel-fs.git" }
-ero-blockwheel-kv = { git = "https://github.com/swizard0/ero-blockwheel-kv.git", branch = "futuresunordered_to_spawn_3" }
+ero-blockwheel-kv = { git = "https://github.com/swizard0/ero-blockwheel-kv.git" }
 alloc-pool = { git = "https://github.com/swizard0/alloc-pool.git" }
 edeltraud = { git = "https://github.com/swizard0/edeltraud.git" }
 
