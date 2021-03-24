@@ -452,7 +452,7 @@ async fn stress_loop(
         }
 
         // construct action and run task
-        if data.data.is_empty() || rng.sample(p_distribution) < 0.5 {
+        if data.data.is_empty() || rng.sample(p_distribution) < limits.insert_or_remove_prob {
             // insert or remove task
             let db_size = limits.actions / 2;
             let insert_prob = 1.0 - (data.alive.len() as f64 / db_size as f64);
@@ -512,7 +512,7 @@ async fn stress_loop(
             let key_index = rng.gen_range(0 .. data.data.len());
             let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
 
-            let lookup_kind = if rng.sample(p_distribution) < 0.5 {
+            let lookup_kind = if rng.sample(p_distribution) < limits.lookup_single_prob {
                 LookupKind::Single
             } else {
                 LookupKind::Range
