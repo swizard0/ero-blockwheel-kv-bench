@@ -56,7 +56,8 @@ print_profile_on_drop = true
 # bench related parameters
 [bench]
 # maximum number of parallel kv access tasks
-active_tasks = 3072
+# active_tasks = 3072
+active_tasks = 8192
 # total number of actions with kv database
 # actions = 131072
 actions = 1048576
