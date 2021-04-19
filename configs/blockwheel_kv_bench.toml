@@ -70,13 +70,13 @@ insert_or_remove_prob = 0.5
 # probability for single lookup task (probability of range lookup: 1.0 - lookup_single_prob)
 lookup_single_prob = 0.5
 # db insert operation timeout (in seconds)
-timeout_insert_secs = 120
+timeout_insert_secs = 180
 # db lookup operation timeout (in seconds)
-timeout_lookup_secs = 240
+timeout_lookup_secs = 6000
 # db lookup range operation timeout (in seconds)
-timeout_lookup_range_secs = 240
+timeout_lookup_range_secs = 6000
 # db remove operation timeout (in seconds)
-timeout_remove_secs = 120
+timeout_remove_secs = 180
 # db flush operation timeout (in seconds)
 timeout_flush_secs = 2400
 

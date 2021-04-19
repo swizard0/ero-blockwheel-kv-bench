@@ -9,7 +9,9 @@ use std::{
     },
     sync::Arc,
     path::PathBuf,
-    collections::HashMap,
+    collections::{
+        HashMap,
+    },
 };
 
 use structopt::{
@@ -125,7 +127,6 @@ enum Error {
     FlushTimedOut,
     ExpectedValueNotFound {
         key: kv::Key,
-        value_cell: kv::ValueCell<kv::Value>,
         lookup_kind: LookupKind,
     },
     UnexpectedValueFound {
@@ -137,7 +138,8 @@ enum Error {
         key: kv::Key,
         key_value_pair: kv::KeyValuePair<kv::Value>,
     },
-    UnexpectedLookupRangeRxFinish,
+    UnexpectedLookupRangeRx0Finish,
+    UnexpectedLookupRangeRx1Finish,
     WheelsGoneDuringFlush,
     SledSerialize(bincode::Error),
     SledDeserialize(bincode::Error),
@@ -145,7 +147,7 @@ enum Error {
 }
 
 fn main() -> Result<(), Error> {
-    pretty_env_logger::init();
+    pretty_env_logger::init_timed();
     let cli_args = CliArgs::from_args();
     log::info!("program starts as: {:?}", cli_args);
 
@@ -503,8 +505,7 @@ async fn stress_loop(
                     active_tasks_counter,
                 );
 
-                let key = key.clone();
-                backend.spawn_remove_task(supervisor_pid, &done_tx, &blocks_pool, &version_provider, key, &limits);
+                backend.spawn_remove_task(supervisor_pid, &done_tx, &blocks_pool, &version_provider, key.clone(), &limits);
                 active_tasks_counter.removes += 1;
             }
         } else {
@@ -679,6 +680,8 @@ impl Backend {
         limits: &toml_config::Bench,
     )
     {
+        log::debug!(" ;; lookup single for: {:?}", key);
+
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
@@ -689,9 +692,7 @@ impl Backend {
                         wheel_kv_pid.lookup(key.clone()),
                     );
                     match lookup_task.await {
-                        Ok(Ok(None)) =>
-                            Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
-                        Ok(Ok(Some(found_value_cell))) =>
+                        Ok(Ok(found_value_cell)) =>
                             Ok(TaskDone::Lookup {
                                 key,
                                 found_value_cell,
@@ -716,7 +717,7 @@ impl Backend {
                     });
                     match tokio::time::timeout(op_timeout, lookup_task).await {
                         Ok(Ok(Ok(None))) =>
-                            Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Single, }),
+                            Err(Error::ExpectedValueNotFound { key, lookup_kind: LookupKind::Single, }),
                         Ok(Ok(Ok(Some(bin)))) => {
                             let sled_entry: SledEntry<'_> = bincode::deserialize(&bin)
                                 .map_err(Error::SledDeserialize)?;
@@ -726,10 +727,10 @@ impl Backend {
                                     value_block.extend_from_slice(data);
                                     Ok(TaskDone::Lookup {
                                         key,
-                                        found_value_cell: kv::ValueCell {
+                                        found_value_cell: Some(kv::ValueCell {
                                             version: sled_entry.version,
                                             cell: kv::Cell::Value(value_block.into()),
-                                        },
+                                        }),
                                         version_snapshot: value_cell.version,
                                         lookup_kind: LookupKind::Single,
                                     })
@@ -737,10 +738,10 @@ impl Backend {
                                 SledValue::Tombstone =>
                                     Ok(TaskDone::Lookup {
                                         key,
-                                        found_value_cell: kv::ValueCell {
+                                        found_value_cell: Some(kv::ValueCell {
                                             version: sled_entry.version,
                                             cell: kv::Cell::Tombstone,
-                                        },
+                                        }),
                                         version_snapshot: value_cell.version,
                                         lookup_kind: LookupKind::Single,
                                     }),
@@ -768,6 +769,8 @@ impl Backend {
         limits: &toml_config::Bench,
     )
     {
+        log::debug!(" ;; lookup range for: {:?}", key);
+
         match self {
             Backend::BlockwheelKv { wheel_kv_pid, .. } => {
                 let mut wheel_kv_pid = wheel_kv_pid.clone();
@@ -789,33 +792,41 @@ impl Backend {
                     );
                     let result = match lookup_range_next_task.await {
                         Ok(None) =>
-                            return Err(Error::UnexpectedLookupRangeRxFinish),
-                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) =>
+                            return Err(Error::UnexpectedLookupRangeRx0Finish),
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) => {
+                            let lookup_range_next_task = tokio::time::timeout(
+                                op_timeout,
+                                lookup_range.key_values_rx.next(),
+                            );
+                            match lookup_range_next_task.await {
+                                Ok(None) =>
+                                    return Err(Error::UnexpectedLookupRangeRx1Finish),
+                                Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) =>
+                                    return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
+                                Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
+                                    (),
+                                Err(..) =>
+                                    return Err(Error::LookupRangeTimedOutLast { key_from: key.clone(), key_to: key, value_cell, }),
+                            }
+
                             TaskDone::Lookup {
                                 key: key.clone(),
-                                found_value_cell: key_value_pair.value_cell,
+                                found_value_cell: Some(key_value_pair.value_cell),
                                 version_snapshot: value_cell.version,
                                 lookup_kind: LookupKind::Range,
-                            },
-                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
-                            return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
+                            }
+                        },
+                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) => {
+                            TaskDone::Lookup {
+                                key: key.clone(),
+                                found_value_cell: None,
+                                version_snapshot: value_cell.version,
+                                lookup_kind: LookupKind::Range,
+                            }
+                        },
                         Err(..) =>
                             return Err(Error::LookupRangeTimedOutFirst { key_from: key.clone(), key_to: key, value_cell, }),
                     };
-                    let lookup_range_next_task = tokio::time::timeout(
-                        op_timeout,
-                        lookup_range.key_values_rx.next(),
-                    );
-                    match lookup_range_next_task.await {
-                        Ok(None) =>
-                            return Err(Error::UnexpectedLookupRangeRxFinish),
-                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::KeyValue(key_value_pair))) =>
-                            return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
-                        Ok(Some(ero_blockwheel_kv::KeyValueStreamItem::NoMore)) =>
-                            (),
-                        Err(..) =>
-                            return Err(Error::LookupRangeTimedOutLast { key_from: key.clone(), key_to: key, value_cell, }),
-                    }
                     assert!(lookup_range.key_values_rx.next().await.is_none());
                     Ok(result)
                 });
@@ -832,7 +843,7 @@ impl Backend {
                         let mut iter = database.range(&*sled_key ..= &*sled_key);
                         let task_done = match iter.next() {
                             None =>
-                                return Err(Error::ExpectedValueNotFound { key, value_cell, lookup_kind: LookupKind::Range, }),
+                                return Err(Error::ExpectedValueNotFound { key, lookup_kind: LookupKind::Range, }),
                             Some(Ok((_found_key_bin, found_bin))) => {
                                 let sled_entry: SledEntry<'_> = bincode::deserialize(&found_bin)
                                     .map_err(Error::SledDeserialize)?;
@@ -842,10 +853,10 @@ impl Backend {
                                         value_block.extend_from_slice(data);
                                         TaskDone::Lookup {
                                             key: key.clone(),
-                                            found_value_cell: kv::ValueCell {
+                                            found_value_cell: Some(kv::ValueCell {
                                                 version: sled_entry.version,
                                                 cell: kv::Cell::Value(value_block.into()),
-                                            },
+                                            }),
                                             version_snapshot: value_cell.version,
                                             lookup_kind: LookupKind::Range,
                                         }
@@ -853,10 +864,10 @@ impl Backend {
                                     SledValue::Tombstone =>
                                         TaskDone::Lookup {
                                             key: key.clone(),
-                                            found_value_cell: kv::ValueCell {
+                                            found_value_cell: Some(kv::ValueCell {
                                                 version: sled_entry.version,
                                                 cell: kv::Cell::Tombstone,
-                                            },
+                                            }),
                                             version_snapshot: value_cell.version,
                                             lookup_kind: LookupKind::Range,
                                         },
@@ -1000,7 +1011,7 @@ impl Backend {
 }
 
 enum TaskDone {
-    Lookup { key: kv::Key, found_value_cell: kv::ValueCell<kv::Value>, version_snapshot: u64, lookup_kind: LookupKind, },
+    Lookup { key: kv::Key, found_value_cell: Option<kv::ValueCell<kv::Value>>, version_snapshot: u64, lookup_kind: LookupKind, },
     Insert { key: kv::Key, value: kv::Value, version: u64, },
     Remove { key: kv::Key, version: u64, },
 }
@@ -1041,37 +1052,48 @@ impl TaskDone {
                     let offset = data.data.len();
                     data.data.push(data_cell);
                     data.index.insert(key.clone(), offset);
-                    data.alive.insert(key, offset);
+                    data.alive.insert(key.clone(), offset);
                 }
+
+                log::debug!(" ;; inserted: {:?}", key);
+
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
             },
             TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind, } => {
                 let &offset = data.index.get(&key).unwrap();
                 let kv::KeyValuePair { value_cell: kv::ValueCell { version: version_current, cell: ref cell_current, }, .. } = data.data[offset];
-                let kv::ValueCell { version: version_found, cell: ref cell_found, } = found_value_cell;
-                if version_found == version_current {
-                    if cell_found == cell_current {
-                        // everything is up to date
-                    } else {
-                        // version matches, but actual values are not
-                        return Err(Error::UnexpectedValueFound {
-                            key,
-                            expected_value_cell: data.data[offset].value_cell.clone(),
-                            found_value_cell,
-                        });
-                    }
-                } else if version_snapshot < version_current {
-                    // deprecated lookup (ignoring)
-                    log::warn!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
-                } else {
-                    // premature lookup (ignoring, don't want to wait)
-                    log::warn!(
-                        "premature lookup: found version {} but current is still {} (awaiting {})",
-                        version_found,
-                        version_current,
-                        version_snapshot,
-                    );
+                match (found_value_cell, cell_current) {
+                    (None, kv::Cell::Tombstone) =>
+                        log::warn!("deprecated lookup: already removed during {:?}", lookup_kind),
+                    (None, kv::Cell::Value(..)) =>
+                        return Err(Error::ExpectedValueNotFound { key, lookup_kind, }),
+                    (Some(found_value_cell), cell_current) => {
+                        let kv::ValueCell { version: version_found, cell: ref cell_found, } = found_value_cell;
+                        if version_found == version_current {
+                            if cell_found == cell_current {
+                                // everything is up to date
+                            } else {
+                                // version matches, but actual values are not
+                                return Err(Error::UnexpectedValueFound {
+                                    key,
+                                    expected_value_cell: data.data[offset].value_cell.clone(),
+                                    found_value_cell,
+                                });
+                            }
+                        } else if version_snapshot < version_current {
+                            // deprecated lookup (ignoring)
+                            log::warn!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
+                        } else {
+                            // premature lookup (ignoring, don't want to wait)
+                            log::warn!(
+                                "premature lookup: found version {} but current is still {} (awaiting {})",
+                                version_found,
+                                version_current,
+                                version_snapshot,
+                            );
+                        }
+                    },
                 }
                 match lookup_kind {
                     LookupKind::Single => {
@@ -1085,6 +1107,9 @@ impl TaskDone {
                 }
             }
             TaskDone::Remove { key, version, } => {
+
+                log::debug!(" ;; removed: {:?}", key);
+
                 let data_cell = kv::KeyValuePair {
                     key: key.clone(),
                     value_cell: kv::ValueCell {
