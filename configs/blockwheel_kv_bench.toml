@@ -11,7 +11,7 @@ manager_task_restart_sec = 1
 # search tree task restart timeout (seconds) for blockwheel kv storage
 search_tree_task_restart_sec = 1
 # maximum number of simultaneously running blocks removing tasks for blockwheel kv storage
-search_tree_remove_tasks_limit = 64
+search_tree_remove_tasks_limit = 128
 # mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
 search_tree_iter_send_buffer = 128
 # maximum entry value size to store with the key, values with greater size will be stored in separate blocks
