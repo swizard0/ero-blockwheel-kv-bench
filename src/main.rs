@@ -14,11 +14,9 @@ use std::{
     },
 };
 
-use structopt::{
-    clap::{
-        AppSettings,
-    },
-    StructOpt,
+use clap::{
+    Parser,
+    AppSettings,
 };
 
 use serde_derive::{
@@ -65,19 +63,19 @@ use ero_blockwheel_kv::{
 
 mod toml_config;
 
-#[derive(Clone, StructOpt, Debug)]
-#[structopt(setting = AppSettings::DeriveDisplayOrder)]
+#[derive(Clone, Parser, Debug)]
+#[clap(setting = AppSettings::DeriveDisplayOrder)]
 struct CliArgs {
     /// program config path
-    #[structopt(long = "config-path", short = "c", default_value = "configs/blockwheel_kv_bench.toml")]
+    #[clap(long, short = 'c', default_value = "configs/blockwheel_kv_bench.toml")]
     pub config_path: PathBuf,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     backend_cmd: BackendCmd,
 }
 
-#[derive(Clone, StructOpt, Debug)]
-#[structopt(about = "kv backend to use")]
+#[derive(Clone, Parser, Debug)]
+#[clap(about = "kv backend to use")]
 pub enum BackendCmd {
     BlockwheelKv,
     Sled,
@@ -94,7 +92,7 @@ struct Config {
 }
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     ConfigRead(io::Error),
     ConfigParse(toml::de::Error),
     SledInvalidMode { mode_provided: String, },
@@ -1017,7 +1015,7 @@ enum TaskDone {
 }
 
 #[derive(Debug)]
-enum LookupKind { Single, Range, }
+pub enum LookupKind { Single, Range, }
 
 fn spawn_task<T>(
     supervisor_pid: &mut SupervisorPid,
