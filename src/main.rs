@@ -59,6 +59,7 @@ use ero::{
 use ero_blockwheel_kv::{
     kv,
     job,
+    wheels,
 };
 
 mod toml_config;
@@ -138,10 +139,11 @@ pub enum Error {
     },
     UnexpectedLookupRangeRx0Finish,
     UnexpectedLookupRangeRx1Finish,
-    WheelsGoneDuringFlush,
     SledSerialize(bincode::Error),
     SledDeserialize(bincode::Error),
-    WheelGoneDuringInfo { blockwheel_filename: ero_blockwheel_kv::wheels::WheelFilename, },
+    WheelGoneDuringInfo { blockwheel_filename: wheels::WheelFilename, },
+    WheelsFlush(wheels::FlushError),
+    WheelsBuilder(wheels::BuilderError),
 }
 
 fn main() -> Result<(), Error> {
@@ -206,6 +208,7 @@ async fn run_blockwheel_kv(
 
     let mut db_files = Vec::new();
     let mut wheel_refs = Vec::new();
+    let mut wheels = wheels::WheelsBuilder::new();
     for fs_config in config.blockwheel_wheels.fss {
         let blockwheel_fs_params = ero_blockwheel_fs::Params {
             interpreter: match fs_config.interpreter {
@@ -241,13 +244,15 @@ async fn run_blockwheel_kv(
         };
 
         db_files.push(blockwheel_filename.clone());
-        wheel_refs.push(ero_blockwheel_kv::wheels::WheelRef {
-            blockwheel_filename: ero_blockwheel_kv::wheels::WheelFilename::from_path(
+        let wheel_ref = wheels::WheelRef {
+            blockwheel_filename: wheels::WheelFilename::from_path(
                 blockwheel_filename,
                 &blocks_pool,
             ),
             blockwheel_pid: blockwheel_fs_pid,
-        });
+        };
+        wheels = wheels.add_wheel_ref(wheel_ref.clone());
+        wheel_refs.push(wheel_ref);
 
         supervisor_pid.spawn_link_permanent(
             blockwheel_fs_gen_server.run(
@@ -259,17 +264,8 @@ async fn run_blockwheel_kv(
         );
     }
 
-    let wheels_gen_server = ero_blockwheel_kv::wheels::GenServer::new();
-    let wheels_pid = wheels_gen_server.pid();
-
-    supervisor_pid.spawn_link_permanent(
-        wheels_gen_server.run(
-            wheel_refs.clone(),
-            ero_blockwheel_kv::wheels::Params {
-                task_restart_sec: config.blockwheel_wheels.task_restart_sec,
-            },
-        ),
-    );
+    let wheels = wheels.build()
+        .map_err(Error::WheelsBuilder)?;
 
     let blockwheel_kv_gen_server = ero_blockwheel_kv::GenServer::new();
     let blockwheel_kv_pid = blockwheel_kv_gen_server.pid();
@@ -280,14 +276,13 @@ async fn run_blockwheel_kv(
             thread_pool.clone(),
             blocks_pool.clone(),
             version_provider.clone(),
-            wheels_pid.clone(),
+            wheels.clone(),
             ero_blockwheel_kv::Params {
+                butcher_block_size: config.blockwheel_kv.butcher_block_size,
                 tree_block_size: config.blockwheel_kv.tree_block_size,
-                butcher_task_restart_sec: config.blockwheel_kv.butcher_task_restart_sec,
+                iter_send_buffer: config.blockwheel_kv.iter_send_buffer,
                 manager_task_restart_sec: config.blockwheel_kv.manager_task_restart_sec,
-                search_tree_task_restart_sec: config.blockwheel_kv.search_tree_task_restart_sec,
                 search_tree_remove_tasks_limit: config.blockwheel_kv.search_tree_remove_tasks_limit,
-                search_tree_iter_send_buffer: config.blockwheel_kv.search_tree_iter_send_buffer,
                 search_tree_values_inline_size_limit: config.blockwheel_kv.search_tree_values_inline_size_limit,
             },
         ),
@@ -297,7 +292,7 @@ async fn run_blockwheel_kv(
         &mut supervisor_pid,
         Backend::BlockwheelKv {
             wheel_kv_pid: blockwheel_kv_pid.clone(),
-            wheels_pid,
+            wheels,
         },
         &blocks_pool,
         &version_provider,
@@ -306,7 +301,7 @@ async fn run_blockwheel_kv(
         &config.bench,
     ).await?;
 
-    for ero_blockwheel_kv::wheels::WheelRef { blockwheel_filename, mut blockwheel_pid, } in wheel_refs {
+    for wheels::WheelRef { blockwheel_filename, mut blockwheel_pid, } in wheel_refs {
         let info = blockwheel_pid.info().await
             .map_err(|ero::NoProcError| Error::WheelGoneDuringInfo { blockwheel_filename: blockwheel_filename.clone(), })?;
         log::info!("{:?} | {:?}", blockwheel_filename, info);
@@ -391,7 +386,7 @@ struct DataIndex {
 enum Backend {
     BlockwheelKv {
         wheel_kv_pid: ero_blockwheel_kv::Pid,
-        wheels_pid: ero_blockwheel_kv::wheels::Pid,
+        wheels: wheels::Wheels,
     },
     Sled { database: Arc<sled::Db>, },
 }
@@ -978,7 +973,7 @@ impl Backend {
     async fn flush(&mut self, limits: &toml_config::Bench) -> Result<(), Error> {
         let op_timeout = Duration::from_secs(limits.timeout_flush_secs);
         match self {
-            Backend::BlockwheelKv { wheel_kv_pid, wheels_pid, } => {
+            Backend::BlockwheelKv { wheel_kv_pid, wheels, } => {
                 let flush_task = tokio::time::timeout(
                     op_timeout,
                     wheel_kv_pid.flush(),
@@ -988,11 +983,11 @@ impl Backend {
                     .and_then(|result| result.map_err(Error::Flush))?;
                 let flush_task = tokio::time::timeout(
                     op_timeout,
-                    wheels_pid.flush(),
+                    wheels.flush(),
                 );
-                let ero_blockwheel_kv::wheels::Flushed = flush_task.await
+                let wheels::Flushed = flush_task.await
                     .map_err(|_| Error::FlushTimedOut)
-                    .and_then(|result| result.map_err(|ero::NoProcError| Error::WheelsGoneDuringFlush))?;
+                    .and_then(|result| result.map_err(Error::WheelsFlush))?;
             },
             Backend::Sled { database, } => {
                 let flush_task = tokio::time::timeout(
@@ -1120,6 +1115,7 @@ impl TaskDone {
                     data.data[offset] = data_cell;
                     data.alive.remove(&key);
                 }
+
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
             },

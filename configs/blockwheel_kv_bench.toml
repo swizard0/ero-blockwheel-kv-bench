@@ -2,18 +2,16 @@
 
 # blockwheel_kv key-value database related parameters
 [blockwheel_kv]
-# blockwheel kv storage n-tree block size
-tree_block_size = 1536
 # butcher task restart timeout (seconds) for blockwheel kv storage
-butcher_task_restart_sec = 1
+butcher_block_size = 1536
+# blockwheel kv storage n-tree block size
+tree_block_size = 512
+# mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
+iter_send_buffer = 4
 # manager task restart timeout (seconds) for blockwheel kv storage
 manager_task_restart_sec = 1
-# search tree task restart timeout (seconds) for blockwheel kv storage
-search_tree_task_restart_sec = 1
 # maximum number of simultaneously running blocks removing tasks for blockwheel kv storage
 search_tree_remove_tasks_limit = 128
-# mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
-search_tree_iter_send_buffer = 128
 # maximum entry value size to store with the key, values with greater size will be stored in separate blocks
 search_tree_values_inline_size_limit = 128
 
