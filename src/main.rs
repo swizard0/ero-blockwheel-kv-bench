@@ -282,8 +282,8 @@ async fn run_blockwheel_kv(
                 tree_block_size: config.blockwheel_kv.tree_block_size,
                 iter_send_buffer: config.blockwheel_kv.iter_send_buffer,
                 manager_task_restart_sec: config.blockwheel_kv.manager_task_restart_sec,
-                search_tree_remove_tasks_limit: config.blockwheel_kv.search_tree_remove_tasks_limit,
                 search_tree_values_inline_size_limit: config.blockwheel_kv.search_tree_values_inline_size_limit,
+                search_tree_bootstrap_search_trees_limit: config.blockwheel_kv.search_tree_bootstrap_search_trees_limit,
             },
         ),
     );
@@ -981,6 +981,7 @@ impl Backend {
                 let ero_blockwheel_kv::Flushed = flush_task.await
                     .map_err(|_| Error::FlushTimedOut)
                     .and_then(|result| result.map_err(Error::Flush))?;
+                log::info!("blockwheel_kv flushed");
                 let flush_task = tokio::time::timeout(
                     op_timeout,
                     wheels.flush(),
@@ -988,6 +989,7 @@ impl Backend {
                 let wheels::Flushed = flush_task.await
                     .map_err(|_| Error::FlushTimedOut)
                     .and_then(|result| result.map_err(Error::WheelsFlush))?;
+                log::info!("blockwheel_fs flushed");
             },
             Backend::Sled { database, } => {
                 let flush_task = tokio::time::timeout(
@@ -1076,10 +1078,10 @@ impl TaskDone {
                             }
                         } else if version_snapshot < version_current {
                             // deprecated lookup (ignoring)
-                            log::warn!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
+                            log::debug!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
                         } else {
                             // premature lookup (ignoring, don't want to wait)
-                            log::warn!(
+                            log::debug!(
                                 "premature lookup: found version {} but current is still {} (awaiting {})",
                                 version_found,
                                 version_current,

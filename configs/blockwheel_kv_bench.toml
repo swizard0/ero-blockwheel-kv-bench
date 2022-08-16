@@ -10,10 +10,10 @@ tree_block_size = 512
 iter_send_buffer = 4
 # manager task restart timeout (seconds) for blockwheel kv storage
 manager_task_restart_sec = 1
-# maximum number of simultaneously running blocks removing tasks for blockwheel kv storage
-search_tree_remove_tasks_limit = 128
 # maximum entry value size to store with the key, values with greater size will be stored in separate blocks
 search_tree_values_inline_size_limit = 128
+# maximum number of not yet flushed (ram) search trees
+search_tree_bootstrap_search_trees_limit = 16
 
 # storage areas manager related parameters
 [blockwheel_wheels]

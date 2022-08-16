@@ -10,8 +10,8 @@ pub struct BlockwheelKv {
     pub tree_block_size: usize,
     pub iter_send_buffer: usize,
     pub manager_task_restart_sec: usize,
-    pub search_tree_remove_tasks_limit: usize,
     pub search_tree_values_inline_size_limit: usize,
+    pub search_tree_bootstrap_search_trees_limit: usize,
 }
 
 #[derive(Clone, Deserialize, Debug)]
