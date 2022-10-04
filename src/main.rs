@@ -115,7 +115,14 @@ pub enum Error {
     Edeltraud(edeltraud::SpawnError),
     InsertedValueNotFoundInDbMirror { key: kv::Key, },
     RemovedValueNotFoundInDbMirror { key: kv::Key, },
+    LookupValueNotFoundInDbMirror { key: kv::Key, },
     ValueNotFoundInMutations { key: kv::Key, serial: usize, },
+    LookupValueNotFound { key: kv::Key, },
+    LookupValueDoesNotMatchDbMirror { key: kv::Key, found_value_cell: kv::ValueCell<ValueCrc64>, },
+    BlockwheelKvInfo(blockwheel_kv_ero::InfoError),
+    BlockwheelKvInsert(blockwheel_kv_ero::InsertError),
+    BlockwheelKvRemove(blockwheel_kv_ero::RemoveError),
+    BlockwheelKvLookup(blockwheel_kv_ero::LookupError),
     // Sled(sled::Error),
     // GenTaskJoin(tokio::task::JoinError),
     // Insert(blockwheel_kv_ero::InsertError),
@@ -266,7 +273,7 @@ async fn run_blockwheel_kv(
         .map_err(Error::WheelsBuilder)?;
 
     let blockwheel_kv_gen_server = blockwheel_kv_ero::GenServer::new();
-    let blockwheel_kv_pid = blockwheel_kv_gen_server.pid();
+    let mut blockwheel_kv_pid = blockwheel_kv_gen_server.pid();
 
     supervisor_pid.spawn_link_permanent(
         blockwheel_kv_gen_server.run(
@@ -297,11 +304,9 @@ async fn run_blockwheel_kv(
         &thread_pool,
     ).await?;
 
-    // for wheels::WheelRef { blockwheel_filename, mut blockwheel_pid, } in wheel_refs {
-    //     let info = blockwheel_pid.info().await
-    //         .map_err(|ero::NoProcError| Error::WheelGoneDuringInfo { blockwheel_filename: blockwheel_filename.clone(), })?;
-    //     log::info!("{:?} | {:?}", blockwheel_filename, info);
-    // }
+    let info = blockwheel_kv_pid.info().await
+        .map_err(Error::BlockwheelKvInfo)?;
+    log::info!("{:?}", info);
 
     Ok(())
 }
@@ -354,29 +359,28 @@ async fn run_blockwheel_kv(
 #[derive(Clone, Copy, Default, Debug)]
 struct Counter {
     lookups: usize,
-    lookups_range: usize,
     inserts: usize,
     removes: usize,
 }
 
 impl Counter {
     fn sum(&self) -> usize {
-        self.lookups + self.lookups_range + self.inserts + self.removes
+        self.lookups + self.inserts + self.removes
     }
 
     fn clear(&mut self) {
         self.lookups = 0;
-        self.lookups_range = 0;
         self.inserts = 0;
         self.removes = 0;
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct ValueCrc64(u64);
+pub struct ValueCrc64(u64);
 
 struct DbMirror {
     data: HashMap<kv::Key, DbMirrorValue>,
+    data_vec: Vec<kv::Key>,
     huge_random_block: Bytes,
 }
 
@@ -401,14 +405,19 @@ impl DbMirror {
 
         Self {
             data: HashMap::new(),
+            data_vec: Vec::new(),
             huge_random_block: random_block.freeze(),
         }
     }
 
-    fn enqueue_mutation(&mut self, key: kv::Key, cell: kv::Cell<ValueCrc64>) {
+    fn enqueue_mutation(&mut self, key: kv::Key, cell: kv::Cell<ValueCrc64>) -> usize {
+        let data_vec = &mut self.data_vec;
         let db_mirror_value = self.data
             .entry(key.clone())
-            .or_insert_with(DbMirrorValue::default);
+            .or_insert_with(|| {
+                data_vec.push(key.clone());
+                DbMirrorValue::default()
+            });
         let serial = db_mirror_value.serial;
         db_mirror_value.serial += 1;
         db_mirror_value.mutations.push(Mutation {
@@ -421,6 +430,7 @@ impl DbMirror {
                 },
             },
         });
+        serial
     }
 }
 
@@ -530,40 +540,48 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
                     &mut active_tasks_counter,
                     &mut actions_counter,
                     &limits,
-                    &thread_pool,
+                    thread_pool,
                 )?;
             }
             std::mem::drop(done_tx);
             break;
         }
-//         let maybe_task_result =
-//             if (active_tasks_counter.sum() >= limits.active_tasks) || (data.data.is_empty() && active_tasks_counter.inserts > 0) {
-//                 Some(done_rx.next().await.unwrap())
-//             } else {
-//                 select! {
-//                     task_result = done_rx.next() =>
-//                         Some(task_result.unwrap()),
-//                     default =>
-//                         None,
-//                 }
-//             };
-//         match maybe_task_result {
-//             None =>
-//                 (),
-//             Some(task_result) => {
-//                 let done_task: TaskDone = task_result?;
-//                 done_task.process(data, counter, &mut active_tasks_counter)?;
-//                 continue;
-//             }
-//         }
+        let maybe_task_result =
+            if (active_tasks_counter.sum() >= limits.active_tasks) || (db_mirror.data_vec.is_empty() && active_tasks_counter.inserts > 0) {
+                Some(done_rx.next().await.unwrap())
+            } else {
+                select! {
+                    task_result = done_rx.next() =>
+                        Some(task_result.unwrap()),
+                    default =>
+                        None,
+                }
+            };
+        if let Some(task_result) = maybe_task_result {
+            let done_task: TaskDone = task_result?;
+            done_task.process(
+                &mut backend,
+                db_mirror,
+                supervisor_pid,
+                &done_tx,
+                blocks_pool,
+                version_provider,
+                counter,
+                &mut active_tasks_counter,
+                &mut actions_counter,
+                &limits,
+                thread_pool,
+            )?;
+            continue;
+        }
 
         // construct action and run task
-        if db_mirror.data.is_empty() || rng.sample(p_distribution) < limits.insert_or_remove_prob {
+        if db_mirror.data_vec.is_empty() || rng.sample(p_distribution) < limits.insert_or_remove_prob {
             // insert or remove task
             let db_size = limits.actions / 2;
-            let insert_prob = 1.0 - (db_mirror.data.len() as f64 / db_size as f64);
+            let insert_prob = 1.0 - (db_mirror.data_vec.len() as f64 / db_size as f64);
             let dice = rng.sample(p_distribution);
-            if db_mirror.data.is_empty() || dice < insert_prob {
+            if db_mirror.data_vec.is_empty() || dice < insert_prob {
                 // prepare insert task
                 let prepare_insert_job = PrepareInsertJob {
                     huge_random_block: db_mirror.huge_random_block.clone(),
@@ -579,78 +597,38 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
                 active_tasks_counter.inserts += 1;
             } else {
                 // remove task
+                let index = rng.gen_range(0 .. db_mirror.data_vec.len());
+                let key = db_mirror.data_vec[index].clone();
 
-                todo!()
-//                 let (key, value) = loop {
-//                     let index = rng.gen_range(0 .. data.alive.len());
-//                     let &key_index = data.alive
-//                         .values()
-//                         .nth(index)
-//                         .unwrap();
-//                     let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
-//                     match &value_cell.cell {
-//                         kv::Cell::Value(value) =>
-//                             break (key, value),
-//                         kv::Cell::Tombstone =>
-//                             continue,
-//                     }
-//                 };
+                log::debug!(
+                    "{}. performing REMOVE with {} bytes key (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
+                    actions_counter,
+                    key.key_bytes.len(),
+                    dice,
+                    1.0 - insert_prob,
+                    counter,
+                    active_tasks_counter,
+                );
 
-//                 log::debug!(
-//                     "{}. performing REMOVE with {} bytes key and {} bytes value (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
-//                     actions_counter,
-//                     key.key_bytes.len(),
-//                     value.value_bytes.len(),
-//                     dice,
-//                     1.0 - insert_prob,
-//                     counter,
-//                     active_tasks_counter,
-//                 );
-
-//                 backend.spawn_remove_task(supervisor_pid, &done_tx, &blocks_pool, &version_provider, key.clone(), &limits);
-//                 active_tasks_counter.removes += 1;
+                let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Tombstone);
+                backend.spawn_remove_task(supervisor_pid, &done_tx, blocks_pool, version_provider, key, serial, &limits);
+                active_tasks_counter.removes += 1;
             }
         } else {
             // lookup task
+            let index = rng.gen_range(0 .. db_mirror.data_vec.len());
+            let key = db_mirror.data_vec[index].clone();
 
-            todo!()
-//             let key_index = rng.gen_range(0 .. data.data.len());
-//             let kv::KeyValuePair { key, value_cell, } = &data.data[key_index];
+            log::debug!(
+                "{}. performing LOOKUP with {} bytes key | {:?}, active = {:?}",
+                actions_counter,
+                key.key_bytes.len(),
+                counter,
+                active_tasks_counter,
+            );
 
-//             let lookup_kind = if rng.sample(p_distribution) < limits.lookup_single_prob {
-//                 LookupKind::Single
-//             } else {
-//                 LookupKind::Range
-//             };
-
-//             log::debug!(
-//                 "{}. performing {:?} LOOKUP with {} bytes key and {} value | {:?}, active = {:?}",
-//                 actions_counter,
-//                 lookup_kind,
-//                 key.key_bytes.len(),
-//                 match &value_cell.cell {
-//                     kv::Cell::Value(value) =>
-//                         format!("{} bytes", value.value_bytes.len()),
-//                     kv::Cell::Tombstone =>
-//                         "tombstone".to_string(),
-//                 },
-//                 counter,
-//                 active_tasks_counter,
-//             );
-
-//             let key = key.clone();
-//             let value_cell = value_cell.clone();
-
-//             match lookup_kind {
-//                 LookupKind::Single => {
-//                     backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, &limits);
-//                     active_tasks_counter.lookups += 1;
-//                 },
-//                 LookupKind::Range => {
-//                     backend.spawn_lookup_range_task(supervisor_pid, &done_tx, &blocks_pool, key, value_cell, &limits);
-//                     active_tasks_counter.lookups_range += 1;
-//                 },
-//             }
+            backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, &limits);
+            active_tasks_counter.lookups += 1;
         }
         actions_counter += 1;
     }
@@ -688,6 +666,7 @@ impl Backend {
         version_provider: &blockwheel_kv_ero::version::Provider,
         key: kv::Key,
         value_block: Bytes,
+        serial: usize,
         limits: &toml_config::Bench,
         thread_pool: &P,
     )
@@ -695,40 +674,13 @@ impl Backend {
     {
         match self {
             Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
-                let blocks_pool = blocks_pool.clone();
-                let thread_pool = thread_pool.clone();
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let mut key_block = blocks_pool.lend();
-//                     let mut value_block = blocks_pool.lend();
-//                     let gen_task = tokio::task::spawn_blocking(move || {
-//                         let mut rng = SmallRng::from_entropy();
-//                         key_block.reserve(key_amount);
-//                         for _ in 0 .. key_amount {
-//                             key_block.push(rng.gen());
-//                         }
-//                         value_block.reserve(value_amount);
-//                         for _ in 0 .. value_amount {
-//                             value_block.push(rng.gen());
-//                         }
-//                         (key_block.freeze(), value_block.freeze())
-//                     });
-//                     let (key_bytes, value_bytes) = gen_task.await
-//                         .map_err(Error::GenTaskJoin)?;
-//                     let key = kv::Key { key_bytes, };
-//                     let value = kv::Value { value_bytes, };
-//                     let insert_task = tokio::time::timeout(
-//                         op_timeout,
-//                         wheel_kv_pid.insert(key.clone(), value.clone()),
-//                     );
-//                     match insert_task.await {
-//                         Ok(Ok(blockwheel_kv_ero::Inserted { version, })) =>
-//                             Ok(TaskDone::Insert { key, value, version, }),
-//                         Ok(Err(error)) =>
-//                             Err(Error::Insert(error)),
-//                         Err(..) =>
-//                             Err(Error::InsertTimedOut { key, }),
-//                     }
-//                 });
+                let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let value = kv::Value { value_bytes: value_block, };
+                    let blockwheel_kv_ero::Inserted { version, } = blockwheel_kv_pid.insert(key.clone(), value).await
+                        .map_err(Error::BlockwheelKvInsert)?;
+                    Ok(TaskDone::Insert { key, serial, version, })
+                });
             },
             Backend::Sled { database, } => {
 //                 let database = database.clone();
@@ -775,20 +727,27 @@ impl Backend {
         }
     }
 
-//     fn spawn_lookup_task(
-//         &mut self,
-//         supervisor_pid: &mut SupervisorPid,
-//         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
-//         blocks_pool: &BytesPool,
-//         key: kv::Key,
-//         value_cell: kv::ValueCell<kv::Value>,
-//         limits: &toml_config::Bench,
-//     )
-//     {
-//         log::debug!(" ;; lookup single for: {:?}", key);
+    fn spawn_lookup_task(
+        &mut self,
+        supervisor_pid: &mut SupervisorPid,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
+        key: kv::Key,
+        limits: &toml_config::Bench,
+    )
+    {
+        log::debug!(" ;; lookup single for: {:?}", key);
 
-//         match self {
-//             Backend::BlockwheelKv { wheel_kv_pid, .. } => {
+        match self {
+            Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
+                let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let found_value_cell = blockwheel_kv_pid.lookup(key.clone()).await
+                        .map_err(Error::BlockwheelKvLookup)?;
+                    Ok(TaskDone::Lookup { key, found_value_cell, })
+                });
+
+                todo!()
 //                 let mut wheel_kv_pid = wheel_kv_pid.clone();
 //                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
 //                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -810,8 +769,10 @@ impl Backend {
 //                             Err(Error::LookupTimedOut { key, value_cell, }),
 //                     }
 //                 });
-//             },
-//             Backend::Sled { database, } => {
+            },
+            Backend::Sled { database, } => {
+
+                todo!()
 //                 let database = database.clone();
 //                 let blocks_pool = blocks_pool.clone();
 //                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
@@ -860,198 +821,33 @@ impl Backend {
 //                             Err(Error::LookupTimedOut { key, value_cell, }),
 //                     }
 //                 });
-//             },
-//         }
-//     }
+            },
+        }
+    }
 
-//     fn spawn_lookup_range_task(
-//         &mut self,
-//         supervisor_pid: &mut SupervisorPid,
-//         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
-//         blocks_pool: &BytesPool,
-//         key: kv::Key,
-//         value_cell: kv::ValueCell<kv::Value>,
-//         limits: &toml_config::Bench,
-//     )
-//     {
-//         log::debug!(" ;; lookup range for: {:?}", key);
+    fn spawn_remove_task(
+        &mut self,
+        supervisor_pid: &mut SupervisorPid,
+        done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
+        blocks_pool: &BytesPool,
+        version_provider: &blockwheel_kv_ero::version::Provider,
+        key: kv::Key,
+        serial: usize,
+        limits: &toml_config::Bench,
+    )
+    {
+        match self {
+            Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
+                let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let blockwheel_kv_ero::Removed { version, } = blockwheel_kv_pid.remove(key.clone()).await
+                        .map_err(Error::BlockwheelKvRemove)?;
+                    Ok(TaskDone::Remove { key, serial, version, })
+                });
+            },
+            Backend::Sled { database, } => {
 
-//         match self {
-//             Backend::BlockwheelKv { wheel_kv_pid, .. } => {
-//                 let mut wheel_kv_pid = wheel_kv_pid.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_lookup_range_secs);
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let lookup_range_task = tokio::time::timeout(
-//                         op_timeout,
-//                         wheel_kv_pid.lookup_range(key.clone() ..= key.clone()),
-//                     );
-//                     let mut lookup_range = match lookup_range_task.await {
-//                         Ok(result) =>
-//                             result.map_err(Error::LookupRange)?,
-//                         Err(..) =>
-//                             return Err(Error::LookupRangeTimedOutInit { key_from: key.clone(), key_to: key, value_cell, }),
-//                     };
-//                     let lookup_range_next_task = tokio::time::timeout(
-//                         op_timeout,
-//                         lookup_range.key_values_rx.next(),
-//                     );
-//                     let result = match lookup_range_next_task.await {
-//                         Ok(None) =>
-//                             return Err(Error::UnexpectedLookupRangeRx0Finish),
-//                         Ok(Some(blockwheel_kv_ero::KeyValueStreamItem::KeyValue(key_value_pair))) => {
-//                             let lookup_range_next_task = tokio::time::timeout(
-//                                 op_timeout,
-//                                 lookup_range.key_values_rx.next(),
-//                             );
-//                             match lookup_range_next_task.await {
-//                                 Ok(None) =>
-//                                     return Err(Error::UnexpectedLookupRangeRx1Finish),
-//                                 Ok(Some(blockwheel_kv_ero::KeyValueStreamItem::KeyValue(key_value_pair))) =>
-//                                     return Err(Error::UnexpectedValueForLookupRange { key, key_value_pair, }),
-//                                 Ok(Some(blockwheel_kv_ero::KeyValueStreamItem::NoMore)) =>
-//                                     (),
-//                                 Err(..) =>
-//                                     return Err(Error::LookupRangeTimedOutLast { key_from: key.clone(), key_to: key, value_cell, }),
-//                             }
-
-//                             TaskDone::Lookup {
-//                                 key: key.clone(),
-//                                 found_value_cell: Some(key_value_pair.value_cell),
-//                                 version_snapshot: value_cell.version,
-//                                 lookup_kind: LookupKind::Range,
-//                             }
-//                         },
-//                         Ok(Some(blockwheel_kv_ero::KeyValueStreamItem::NoMore)) => {
-//                             TaskDone::Lookup {
-//                                 key: key.clone(),
-//                                 found_value_cell: None,
-//                                 version_snapshot: value_cell.version,
-//                                 lookup_kind: LookupKind::Range,
-//                             }
-//                         },
-//                         Err(..) =>
-//                             return Err(Error::LookupRangeTimedOutFirst { key_from: key.clone(), key_to: key, value_cell, }),
-//                     };
-//                     assert!(lookup_range.key_values_rx.next().await.is_none());
-//                     Ok(result)
-//                 });
-//             },
-//             Backend::Sled { database, } => {
-//                 let database = database.clone();
-//                 let blocks_pool = blocks_pool.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_lookup_range_secs);
-//                 let key_clone = key.clone();
-//                 let value_cell_clone = value_cell.clone();
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let sled_key = key.key_bytes.clone();
-//                     let lookup_range_task = tokio::task::spawn_blocking(move || {
-//                         let mut iter = database.range(&*sled_key ..= &*sled_key);
-//                         let task_done = match iter.next() {
-//                             None =>
-//                                 return Err(Error::ExpectedValueNotFound { key, lookup_kind: LookupKind::Range, }),
-//                             Some(Ok((_found_key_bin, found_bin))) => {
-//                                 let sled_entry: SledEntry<'_> = bincode::deserialize(&found_bin)
-//                                     .map_err(Error::SledDeserialize)?;
-//                                 match sled_entry.value {
-//                                     SledValue::Value { data, } => {
-//                                         let mut value_block = blocks_pool.lend();
-//                                         value_block.extend_from_slice(data);
-//                                         TaskDone::Lookup {
-//                                             key: key.clone(),
-//                                             found_value_cell: Some(kv::ValueCell {
-//                                                 version: sled_entry.version,
-//                                                 cell: kv::Cell::Value(value_block.into()),
-//                                             }),
-//                                             version_snapshot: value_cell.version,
-//                                             lookup_kind: LookupKind::Range,
-//                                         }
-//                                     },
-//                                     SledValue::Tombstone =>
-//                                         TaskDone::Lookup {
-//                                             key: key.clone(),
-//                                             found_value_cell: Some(kv::ValueCell {
-//                                                 version: sled_entry.version,
-//                                                 cell: kv::Cell::Tombstone,
-//                                             }),
-//                                             version_snapshot: value_cell.version,
-//                                             lookup_kind: LookupKind::Range,
-//                                         },
-//                                 }
-//                             },
-//                             Some(Err(error)) =>
-//                                 return Err(Error::LookupRangeSledNext(error)),
-//                         };
-//                         match iter.next() {
-//                             None =>
-//                                 (),
-//                             Some(Ok((found_key_bin, found_value_bin))) => {
-//                                 let mut key_block = blocks_pool.lend();
-//                                 key_block.extend_from_slice(&found_key_bin);
-//                                 let mut value_block = blocks_pool.lend();
-//                                 value_block.extend_from_slice(&found_value_bin);
-//                                 return Err(Error::UnexpectedValueForLookupRange {
-//                                     key: key,
-//                                     key_value_pair: kv::KeyValuePair {
-//                                         key: key_block.into(),
-//                                         value_cell: kv::ValueCell {
-//                                             version: 0,
-//                                             cell: kv::Cell::Value(value_block.into()),
-//                                         },
-//                                     },
-//                                 });
-//                             },
-//                             Some(Err(error)) =>
-//                                 return Err(Error::LookupRangeSledLast(error)),
-//                         }
-//                         Ok(task_done)
-//                     });
-//                     match tokio::time::timeout(op_timeout, lookup_range_task).await {
-//                         Ok(Ok(result)) =>
-//                             result,
-//                         Ok(Err(error)) =>
-//                             Err(Error::LookupTaskJoin(error)),
-//                         Err(..) =>
-//                             Err(Error::LookupRangeTimedOut {
-//                                 key_from: key_clone.clone(),
-//                                 key_to: key_clone.clone(),
-//                                 value_cell: value_cell_clone,
-//                             }),
-//                     }
-//                 });
-//             },
-//         }
-//     }
-
-//     fn spawn_remove_task(
-//         &mut self,
-//         supervisor_pid: &mut SupervisorPid,
-//         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
-//         blocks_pool: &BytesPool,
-//         version_provider: &blockwheel_kv_ero::version::Provider,
-//         key: kv::Key,
-//         limits: &toml_config::Bench,
-//     )
-//     {
-//         match self {
-//             Backend::BlockwheelKv { wheel_kv_pid, .. } => {
-//                 let mut wheel_kv_pid = wheel_kv_pid.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let remove_task = tokio::time::timeout(
-//                         op_timeout,
-//                         wheel_kv_pid.remove(key.clone()),
-//                     );
-//                     match remove_task.await {
-//                         Ok(Ok(blockwheel_kv_ero::Removed { version, })) =>
-//                             Ok(TaskDone::Remove { key, version, }),
-//                         Ok(Err(error)) =>
-//                             Err(Error::Remove(error)),
-//                         Err(..) =>
-//                             Err(Error::RemoveTimedOut { key, }),
-//                     }
-//                 });
-//             },
-//             Backend::Sled { database, } => {
+                todo!()
 //                 let database = database.clone();
 //                 let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
 //                 let blocks_pool = blocks_pool.clone();
@@ -1078,9 +874,9 @@ impl Backend {
 //                             Err(Error::RemoveTimedOut { key, }),
 //                     }
 //                 });
-//             },
-//         }
-//     }
+            },
+        }
+    }
 
     async fn flush(&mut self, limits: &toml_config::Bench) -> Result<(), Error> {
 
@@ -1122,6 +918,7 @@ impl Backend {
 enum Job {
     BlockwheelKvEro(blockwheel_kv_ero::job::Job),
     PrepareInsert(edeltraud::AsyncJob<PrepareInsertJob>),
+    CalculateCrc(edeltraud::AsyncJob<CalculateCrcJob>),
 }
 
 impl From<blockwheel_kv_ero::job::Job> for Job {
@@ -1136,6 +933,12 @@ impl From<edeltraud::AsyncJob<PrepareInsertJob>> for Job {
     }
 }
 
+impl From<edeltraud::AsyncJob<CalculateCrcJob>> for Job {
+    fn from(job: edeltraud::AsyncJob<CalculateCrcJob>) -> Job {
+        Job::CalculateCrc(job)
+    }
+}
+
 impl edeltraud::Job for Job {
     fn run<P>(self, thread_pool: &P) where P: edeltraud::ThreadPool<Self> {
         match self {
@@ -1143,6 +946,9 @@ impl edeltraud::Job for Job {
                 job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
             },
             Job::PrepareInsert(job) => {
+                job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
+            },
+            Job::CalculateCrc(job) => {
                 job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
             },
         }
@@ -1178,6 +984,27 @@ impl edeltraud::Computation for PrepareInsertJob {
     }
 }
 
+struct CalculateCrcJob {
+    key: kv::Key,
+    found_version: u64,
+    found_value: kv::Value,
+}
+
+impl edeltraud::Computation for CalculateCrcJob {
+    type Output = Result<TaskDone, Error>;
+
+    fn run(self) -> Self::Output {
+        let value_crc64 = ValueCrc64(block::crc(&self.found_value.value_bytes));
+        Ok(TaskDone::LookupReady {
+            key: self.key,
+            found_value_cell: Some(kv::ValueCell {
+                version: self.found_version,
+                cell: kv::Cell::Value(value_crc64),
+            }),
+        })
+    }
+}
+
 
 enum TaskDone {
     PrepareInsert {
@@ -1195,14 +1022,15 @@ enum TaskDone {
         serial: usize,
         version: u64,
     },
-    // Lookup {
-    //     key: kv::Key,
-    //     found_value_cell: Option<kv::ValueCell<kv::Value>>,
-    // },
+    Lookup {
+        key: kv::Key,
+        found_value_cell: Option<kv::ValueCell<kv::Value>>,
+    },
+    LookupReady {
+        key: kv::Key,
+        found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
+    },
 }
-
-// #[derive(Debug)]
-// pub enum LookupKind { Single, Range, }
 
 fn spawn_task<T>(
     supervisor_pid: &mut SupervisorPid,
@@ -1233,7 +1061,7 @@ impl TaskDone {
         thread_pool: &P,
     )
         -> Result<(), Error>
-    where P: edeltraud::ThreadPool<Job> + Clone,
+    where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
     {
         match self {
 
@@ -1247,19 +1075,19 @@ impl TaskDone {
                     active_tasks_counter,
                 );
                 let key = kv::Key { key_bytes: key_block, };
-
+                let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Value(value_crc64));
                 backend.spawn_insert_task(
                     supervisor_pid,
                     done_tx,
                     blocks_pool,
                     version_provider,
-                    key.clone(),
+                    key,
                     value_block,
+                    serial,
                     limits,
                     thread_pool,
                 );
-
-                db_mirror.enqueue_mutation(key, kv::Cell::Value(value_crc64));
+                Ok(())
             },
 
             TaskDone::Insert { key, serial, version, } => {
@@ -1269,6 +1097,7 @@ impl TaskDone {
                 log::debug!(" ;; inserted: {:?}", key);
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
+                Ok(())
             },
 
             TaskDone::Remove { key, serial, version, } => {
@@ -1278,55 +1107,122 @@ impl TaskDone {
                 log::debug!(" ;; removed: {:?}", key);
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
+                Ok(())
             },
 
-//             TaskDone::Lookup { key, found_value_cell, version_snapshot, lookup_kind, } => {
-//                 let &offset = data.index.get(&key).unwrap();
-//                 let kv::KeyValuePair { value_cell: kv::ValueCell { version: version_current, cell: ref cell_current, }, .. } = data.data[offset];
-//                 match (found_value_cell, cell_current) {
-//                     (None, kv::Cell::Tombstone) =>
-//                         log::warn!("deprecated lookup: already removed during {:?}", lookup_kind),
-//                     (None, kv::Cell::Value(..)) =>
-//                         return Err(Error::ExpectedValueNotFound { key, lookup_kind, }),
-//                     (Some(found_value_cell), cell_current) => {
-//                         let kv::ValueCell { version: version_found, cell: ref cell_found, } = found_value_cell;
-//                         if version_found == version_current {
-//                             if cell_found == cell_current {
-//                                 // everything is up to date
-//                             } else {
-//                                 // version matches, but actual values are not
-//                                 return Err(Error::UnexpectedValueFound {
-//                                     key,
-//                                     expected_value_cell: data.data[offset].value_cell.clone(),
-//                                     found_value_cell,
-//                                 });
-//                             }
-//                         } else if version_snapshot < version_current {
-//                             // deprecated lookup (ignoring)
-//                             log::debug!("deprecated lookup: awaiting version {} but there is {} already", version_snapshot, version_current);
-//                         } else {
-//                             // premature lookup (ignoring, don't want to wait)
-//                             log::debug!(
-//                                 "premature lookup: found version {} but current is still {} (awaiting {})",
-//                                 version_found,
-//                                 version_current,
-//                                 version_snapshot,
-//                             );
-//                         }
-//                     },
-//                 }
-//                 match lookup_kind {
-//                     LookupKind::Single => {
-//                         counter.lookups += 1;
-//                         active_tasks_counter.lookups -= 1;
-//                     },
-//                     LookupKind::Range => {
-//                         counter.lookups_range += 1;
-//                         active_tasks_counter.lookups_range -= 1;
-//                     },
-//                 }
-//             }
+            TaskDone::Lookup { key, found_value_cell, } =>
+                match found_value_cell {
+                    None =>
+                        process_lookup_ready(db_mirror, counter, active_tasks_counter, key, None),
+                    Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, }) =>
+                        process_lookup_ready(db_mirror, counter, active_tasks_counter, key, Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, })),
+                    Some(kv::ValueCell { version, cell: kv::Cell::Value(value), }) => {
+                        // calculate crc task
+                        let calculate_crc_job = CalculateCrcJob {
+                            key,
+                            found_version: version,
+                            found_value: value,
+                        };
+                        let thread_pool = thread_pool.clone();
+                        spawn_task(supervisor_pid, done_tx.clone(), async move {
+                            edeltraud::job_async(&thread_pool, calculate_crc_job)
+                                .map_err(Error::Edeltraud)?
+                                .await
+                                .map_err(Error::Edeltraud)?
+                        });
+                        Ok(())
+                    },
+            },
+
+            TaskDone::LookupReady { key, found_value_cell, } =>
+                process_lookup_ready(db_mirror, counter, active_tasks_counter, key, found_value_cell),
+
         }
-        Ok(())
     }
+}
+
+fn process_lookup_ready(
+    db_mirror: &mut DbMirror,
+    counter: &mut Counter,
+    active_tasks_counter: &mut Counter,
+    key: kv::Key,
+    maybe_found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
+)
+    -> Result<(), Error>
+{
+    let found_value_cell = maybe_found_value_cell
+        .ok_or_else(|| Error::LookupValueNotFound { key: key.clone(), })?;
+    let db_mirror_value = db_mirror.data.get(&key)
+        .ok_or_else(|| Error::LookupValueNotFoundInDbMirror { key: key.clone(), })?;
+    verify_lookup_value(key, db_mirror_value, found_value_cell)?;
+
+    counter.lookups += 1;
+    active_tasks_counter.lookups -= 1;
+    todo!()
+}
+
+fn verify_lookup_value(key: kv::Key, db_mirror_value: &DbMirrorValue, found_value_cell: kv::ValueCell<ValueCrc64>) -> Result<(), Error> {
+    // first check actual snapshot
+    match (&db_mirror_value.snapshot, &found_value_cell) {
+        (
+            Some(Mutation {
+                key_value_crc64_pair: kv::KeyValuePair {
+                    value_cell: kv::ValueCell {
+                        version: snapshot_version,
+                        cell: snapshot_cell,
+                    },
+                    ..
+                },
+                ..
+            }),
+            kv::ValueCell {
+                version: found_version,
+                cell: found_cell,
+            },
+        ) if snapshot_version == found_version && snapshot_cell == found_cell =>
+            return Ok(()),
+        (Some(Mutation { .. }), kv::ValueCell { .. }) |
+        (None, kv::ValueCell { .. }) =>
+            (),
+    }
+
+    for mutation in &db_mirror_value.mutations {
+        match (mutation, &found_value_cell) {
+            (
+                Mutation {
+                    key_value_crc64_pair: kv::KeyValuePair {
+                        value_cell: kv::ValueCell {
+                            version: snapshot_version,
+                            cell: snapshot_cell,
+                        },
+                        ..
+                    },
+                    ..
+                },
+                kv::ValueCell {
+                    version: found_version,
+                    cell: found_cell,
+                },
+            ) if snapshot_version == found_version && snapshot_cell == found_cell =>
+                return Ok(()),
+            (
+                Mutation {
+                    key_value_crc64_pair: kv::KeyValuePair {
+                        value_cell: kv::ValueCell {
+                            version: 0,
+                            cell: snapshot_cell,
+                        },
+                        ..
+                    },
+                    ..
+                },
+                kv::ValueCell { cell: found_cell, .. },
+            ) if snapshot_cell == found_cell =>
+                return Ok(()),
+            (Mutation { .. }, kv::ValueCell { .. }) =>
+                (),
+        }
+    }
+
+    Err(Error::LookupValueDoesNotMatchDbMirror { key, found_value_cell, })
 }
