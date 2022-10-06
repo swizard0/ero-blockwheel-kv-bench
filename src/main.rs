@@ -3,7 +3,7 @@
 use std::{
     io,
     fs,
-    mem,
+    fmt,
     time::{
         Instant,
         Duration,
@@ -15,11 +15,8 @@ use std::{
         PathBuf,
     },
     collections::{
+        hash_map,
         HashMap,
-        BinaryHeap,
-    },
-    cmp::{
-        Ordering,
     },
 };
 
@@ -113,16 +110,25 @@ pub enum Error {
     TokioRuntime(io::Error),
     ThreadPool(edeltraud::BuildError),
     Edeltraud(edeltraud::SpawnError),
-    InsertedValueNotFoundInDbMirror { key: kv::Key, },
-    RemovedValueNotFoundInDbMirror { key: kv::Key, },
-    LookupValueNotFoundInDbMirror { key: kv::Key, },
-    ValueNotFoundInMutations { key: kv::Key, serial: usize, },
-    LookupValueNotFound { key: kv::Key, },
-    LookupValueDoesNotMatchDbMirror { key: kv::Key, found_value_cell: kv::ValueCell<ValueCrc64>, },
+    InsertedValueNotFoundInDbMirror { key: DebugKey, },
+    RemovedValueNotFoundInDbMirror { key: DebugKey, },
+    LookupValueNotFoundInDbMirror { key: DebugKey, serial: usize, },
+    ValueNotFoundInMutations {
+        key: DebugKey,
+        serial: usize,
+        version: u64,
+    },
+    LookupValueDoesNotMatchDbMirror {
+        key: DebugKey,
+        found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
+        serials_count: usize,
+        snapshots: Vec<(usize, kv::ValueCell<ValueCrc64>)>,
+    },
     BlockwheelKvInfo(blockwheel_kv_ero::InfoError),
     BlockwheelKvInsert(blockwheel_kv_ero::InsertError),
     BlockwheelKvRemove(blockwheel_kv_ero::RemoveError),
     BlockwheelKvLookup(blockwheel_kv_ero::LookupError),
+    BlockwheelKvFlush(blockwheel_kv_ero::FlushError),
     // Sled(sled::Error),
     // GenTaskJoin(tokio::task::JoinError),
     // Insert(blockwheel_kv_ero::InsertError),
@@ -147,26 +153,9 @@ pub enum Error {
     // LookupRangeTimedOutFirst { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
     // LookupRangeTimedOutLast { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
     // RemoveTimedOut { key: kv::Key, },
-    // FlushTimedOut,
-    // ExpectedValueNotFound {
-    //     key: kv::Key,
-    //     lookup_kind: LookupKind,
-    // },
-    // UnexpectedValueFound {
-    //     key: kv::Key,
-    //     expected_value_cell: kv::ValueCell<kv::Value>,
-    //     found_value_cell: kv::ValueCell<kv::Value>,
-    // },
-    // UnexpectedValueForLookupRange {
-    //     key: kv::Key,
-    //     key_value_pair: kv::KeyValuePair<kv::Value>,
-    // },
-    // UnexpectedLookupRangeRx0Finish,
-    // UnexpectedLookupRangeRx1Finish,
+    FlushTimedOut,
     // SledSerialize(bincode::Error),
     // SledDeserialize(bincode::Error),
-    // WheelGoneDuringInfo { blockwheel_filename: wheels::WheelFilename, },
-    // WheelsFlush(wheels::FlushError),
     WheelsBuilder(wheels::Error),
 }
 
@@ -198,7 +187,7 @@ fn main() -> Result<(), Error> {
             for fs_config in &config.blockwheel_wheels.fss {
                 fs::remove_file(&fs_config.wheel_filename).ok();
             }
-            runtime.block_on(run_blockwheel_kv(blocks_pool, config.clone(), &mut db_mirror, &mut counter))?;
+            runtime.block_on(run_blockwheel_kv(blocks_pool, config, &mut db_mirror, &mut counter))?;
         },
         BackendCmd::Sled => {
             fs::remove_dir_all(&config.sled.directory).ok();
@@ -367,21 +356,33 @@ impl Counter {
     fn sum(&self) -> usize {
         self.lookups + self.inserts + self.removes
     }
-
-    fn clear(&mut self) {
-        self.lookups = 0;
-        self.inserts = 0;
-        self.removes = 0;
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ValueCrc64(u64);
 
 struct DbMirror {
-    data: HashMap<kv::Key, DbMirrorValue>,
-    data_vec: Vec<kv::Key>,
+    data: HashMap<DbMirrorKey, DbMirrorValue>,
+    data_vec: Vec<DbMirrorEntry>,
     huge_random_block: Bytes,
+}
+
+struct DbMirrorValue {
+    db_mirror_entry_index: usize,
+    key_value_crc64_pair: kv::KeyValuePair<ValueCrc64>,
+}
+
+#[derive(PartialEq, Eq, Clone, Hash)]
+struct DbMirrorKey {
+    key: kv::Key,
+    serial: usize,
+}
+
+#[derive(Clone)]
+struct DbMirrorEntry {
+    key: kv::Key,
+    next_serial: usize,
+    committed: bool,
 }
 
 #[allow(clippy::identity_op)]
@@ -411,82 +412,61 @@ impl DbMirror {
     }
 
     fn enqueue_mutation(&mut self, key: kv::Key, cell: kv::Cell<ValueCrc64>) -> usize {
-        let data_vec = &mut self.data_vec;
-        let db_mirror_value = self.data
-            .entry(key.clone())
-            .or_insert_with(|| {
-                data_vec.push(key.clone());
-                DbMirrorValue::default()
-            });
-        let serial = db_mirror_value.serial;
-        db_mirror_value.serial += 1;
-        db_mirror_value.mutations.push(Mutation {
-            serial,
-            key_value_crc64_pair: kv::KeyValuePair {
-                key,
-                value_cell: kv::ValueCell {
-                    version: 0,
-                    cell,
+        let db_mirror_entry_index = match self.data.entry(DbMirrorKey { key: key.clone(), serial: 0, }) {
+            hash_map::Entry::Vacant(ve) => {
+                let db_mirror_entry_index = self.data_vec.len();
+                self.data_vec.push(DbMirrorEntry {
+                    key: key.clone(),
+                    next_serial: 1,
+                    committed: false,
+                });
+                ve.insert(DbMirrorValue {
+                    db_mirror_entry_index,
+                    key_value_crc64_pair: kv::KeyValuePair {
+                        key,
+                        value_cell: kv::ValueCell {
+                            version: 0,
+                            cell,
+                        },
+                    },
+                });
+                return 0;
+            },
+            hash_map::Entry::Occupied(oe) => {
+                oe.get().db_mirror_entry_index
+            },
+        };
+        let db_mirror_entry = &mut self.data_vec[db_mirror_entry_index];
+        let serial = db_mirror_entry.next_serial;
+        db_mirror_entry.next_serial += 1;
+        self.data.insert(
+            DbMirrorKey { key: key.clone(), serial, },
+            DbMirrorValue {
+                db_mirror_entry_index,
+                key_value_crc64_pair: kv::KeyValuePair {
+                    key,
+                    value_cell: kv::ValueCell {
+                        version: 0,
+                        cell,
+                    },
                 },
             },
-        });
+        );
         serial
     }
-}
 
-#[derive(Default)]
-struct DbMirrorValue {
-    serial: usize,
-    snapshot: Option<Mutation>,
-    mutations: Vec<Mutation>,
-    mutations_swap: Vec<Mutation>,
-}
-
-impl DbMirrorValue {
-    fn commit(&mut self, key: kv::Key, serial: usize, version: u64) -> Result<(), Error> {
-        let mut found = false;
-        for mutation in &mut self.mutations {
-            if mutation.serial == serial {
-                mutation.key_value_crc64_pair.value_cell.version = version;
-                assert_eq!(key, mutation.key_value_crc64_pair.key);
-                found = true;
-            }
-        }
-        if !found {
-            return Err(Error::ValueNotFoundInMutations { key, serial, });
-        }
-
-        loop {
-            assert!(self.mutations_swap.is_empty());
-            let mut committed = false;
-            while let Some(mutation) = self.mutations.pop() {
-                match &mut self.snapshot {
-                    maybe_snapshot @ None =>
-                        *maybe_snapshot = Some(mutation),
-                    Some(snapshot) if mutation.serial == snapshot.serial + 1 =>
-                        *snapshot = mutation,
-                    Some(..) => {
-                        self.mutations_swap.push(mutation);
-                        continue;
-                    },
-                }
-                committed = true;
-                break;
-            }
-            self.mutations_swap.append(&mut self.mutations);
-            mem::swap(&mut self.mutations, &mut self.mutations_swap);
-            if !committed {
-                break;
-            }
-        }
-
+    fn commit_mutation(&mut self, key: kv::Key, serial: usize, version: u64) -> Result<(), Error> {
+        let db_mirror_value = self.data.get_mut(&DbMirrorKey { key: key.clone(), serial, })
+            .ok_or_else(|| Error::ValueNotFoundInMutations {
+                key: key.into(),
+                serial,
+                version,
+            })?;
+        db_mirror_value.key_value_crc64_pair.value_cell.version = version;
+        let db_mirror_entry = &mut self.data_vec[db_mirror_value.db_mirror_entry_index];
+        db_mirror_entry.committed = true;
         Ok(())
     }
-}
-
-struct Mutation {
-    serial: usize,
-    key_value_crc64_pair: kv::KeyValuePair<ValueCrc64>,
 }
 
 #[derive(Clone)]
@@ -514,8 +494,6 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
 {
     let mut rng = SmallRng::from_entropy();
     let p_distribution = Uniform::new(0.0, 1.0);
-    let key_distribution = Uniform::new(1, limits.key_size_bytes);
-    let value_distribution = Uniform::new(1, limits.value_size_bytes);
 
     let (done_tx, done_rx) = mpsc::channel(0);
     pin_mut!(done_rx);
@@ -598,36 +576,53 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
             } else {
                 // remove task
                 let index = rng.gen_range(0 .. db_mirror.data_vec.len());
-                let key = db_mirror.data_vec[index].clone();
+                let db_mirror_entry = db_mirror.data_vec[index].clone();
+                let serial = db_mirror.enqueue_mutation(db_mirror_entry.key.clone(), kv::Cell::Tombstone);
 
                 log::debug!(
-                    "{}. performing REMOVE with {} bytes key (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
+                    "{}. performing REMOVE with {:?} key (serial: {serial}) (dice = {:.3}, prob = {:.3}) | {:?}, active = {:?}",
                     actions_counter,
-                    key.key_bytes.len(),
+                    &db_mirror_entry.key.key_bytes[..],
                     dice,
                     1.0 - insert_prob,
                     counter,
                     active_tasks_counter,
                 );
 
-                let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Tombstone);
-                backend.spawn_remove_task(supervisor_pid, &done_tx, blocks_pool, version_provider, key, serial, &limits);
+                backend.spawn_remove_task(
+                    supervisor_pid,
+                    &done_tx,
+                    blocks_pool,
+                    version_provider,
+                    db_mirror_entry.key,
+                    serial,
+                    &limits,
+                );
                 active_tasks_counter.removes += 1;
             }
         } else {
             // lookup task
             let index = rng.gen_range(0 .. db_mirror.data_vec.len());
-            let key = db_mirror.data_vec[index].clone();
+            let db_mirror_entry = &db_mirror.data_vec[index];
 
             log::debug!(
-                "{}. performing LOOKUP with {} bytes key | {:?}, active = {:?}",
+                "{}. performing LOOKUP with {:?} key ({} serials, committed = {:?}) | {:?}, active = {:?}",
                 actions_counter,
-                key.key_bytes.len(),
+                &db_mirror_entry.key.key_bytes[..],
+                db_mirror_entry.next_serial,
+                db_mirror_entry.committed,
                 counter,
                 active_tasks_counter,
             );
 
-            backend.spawn_lookup_task(supervisor_pid, &done_tx, &blocks_pool, key, &limits);
+            backend.spawn_lookup_task(
+                supervisor_pid,
+                &done_tx,
+                blocks_pool,
+                db_mirror_entry.key.clone(),
+                db_mirror_entry.committed,
+                &limits,
+            );
             active_tasks_counter.lookups += 1;
         }
         actions_counter += 1;
@@ -637,11 +632,11 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
 
     log::info!("FINISHED main bench: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
 
-     backend.flush(&limits).await?;
+    backend.flush(&limits).await?;
 
-     log::info!("FINISHED db flush: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
+    log::info!("FINISHED db flush: elapsed = {:?} | {:?}", bench_start.elapsed(), counter);
 
-     Ok(())
+    Ok(())
 }
 
 // #[derive(Serialize, Deserialize)]
@@ -733,21 +728,18 @@ impl Backend {
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
         key: kv::Key,
+        committed: bool,
         limits: &toml_config::Bench,
     )
     {
-        log::debug!(" ;; lookup single for: {:?}", key);
-
         match self {
             Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
                 let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let found_value_cell = blockwheel_kv_pid.lookup(key.clone()).await
                         .map_err(Error::BlockwheelKvLookup)?;
-                    Ok(TaskDone::Lookup { key, found_value_cell, })
+                    Ok(TaskDone::Lookup { key, found_value_cell, committed, })
                 });
-
-                todo!()
 //                 let mut wheel_kv_pid = wheel_kv_pid.clone();
 //                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
 //                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -879,29 +871,21 @@ impl Backend {
     }
 
     async fn flush(&mut self, limits: &toml_config::Bench) -> Result<(), Error> {
+        let op_timeout = Duration::from_secs(limits.timeout_flush_secs);
+        match self {
+            Backend::BlockwheelKv { blockwheel_kv_pid, } => {
+                let flush_task = tokio::time::timeout(
+                    op_timeout,
+                    blockwheel_kv_pid.flush_all(),
+                );
+                let blockwheel_kv_ero::Flushed = flush_task.await
+                    .map_err(|_| Error::FlushTimedOut)
+                    .and_then(|result| result.map_err(Error::BlockwheelKvFlush))?;
+                log::info!("blockwheel_kv flushed");
+            },
+            Backend::Sled { database, } => {
 
-        todo!()
-//         let op_timeout = Duration::from_secs(limits.timeout_flush_secs);
-//         match self {
-//             Backend::BlockwheelKv { wheel_kv_pid, wheels, } => {
-//                 let flush_task = tokio::time::timeout(
-//                     op_timeout,
-//                     wheel_kv_pid.flush(),
-//                 );
-//                 let blockwheel_kv_ero::Flushed = flush_task.await
-//                     .map_err(|_| Error::FlushTimedOut)
-//                     .and_then(|result| result.map_err(Error::Flush))?;
-//                 log::info!("blockwheel_kv flushed");
-//                 let flush_task = tokio::time::timeout(
-//                     op_timeout,
-//                     wheels.flush(),
-//                 );
-//                 let wheels::Flushed = flush_task.await
-//                     .map_err(|_| Error::FlushTimedOut)
-//                     .and_then(|result| result.map_err(Error::WheelsFlush))?;
-//                 log::info!("blockwheel_fs flushed");
-//             },
-//             Backend::Sled { database, } => {
+                todo!()
 //                 let flush_task = tokio::time::timeout(
 //                     op_timeout,
 //                     database.flush_async(),
@@ -909,9 +893,9 @@ impl Backend {
 //                 flush_task.await
 //                     .map_err(|_| Error::FlushTimedOut)
 //                     .and_then(|result| result.map_err(Error::FlushSled))?;
-//             },
-//         }
-//         Ok(())
+            },
+        }
+        Ok(())
     }
 }
 
@@ -988,6 +972,7 @@ struct CalculateCrcJob {
     key: kv::Key,
     found_version: u64,
     found_value: kv::Value,
+    committed: bool,
 }
 
 impl edeltraud::Computation for CalculateCrcJob {
@@ -1001,6 +986,7 @@ impl edeltraud::Computation for CalculateCrcJob {
                 version: self.found_version,
                 cell: kv::Cell::Value(value_crc64),
             }),
+            committed: self.committed,
         })
     }
 }
@@ -1025,10 +1011,12 @@ enum TaskDone {
     Lookup {
         key: kv::Key,
         found_value_cell: Option<kv::ValueCell<kv::Value>>,
+        committed: bool,
     },
     LookupReady {
         key: kv::Key,
         found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
+        committed: bool,
     },
 }
 
@@ -1066,16 +1054,18 @@ impl TaskDone {
         match self {
 
             TaskDone::PrepareInsert { key_block, value_block, value_crc64 } => {
+                let key = kv::Key { key_bytes: key_block, };
+                let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Value(value_crc64));
+
                 log::debug!(
-                    "{}. performing INSERT with {} bytes key and {} bytes value | {:?}, active = {:?}",
+                    "{}. performing INSERT with {:?} key (serial: {serial}) and {} bytes value | {:?}, active = {:?}",
                     actions_counter,
-                    key_block.len(),
+                    &key.key_bytes[..],
                     value_block.len(),
                     counter,
                     active_tasks_counter,
                 );
-                let key = kv::Key { key_bytes: key_block, };
-                let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Value(value_crc64));
+
                 backend.spawn_insert_task(
                     supervisor_pid,
                     done_tx,
@@ -1091,37 +1081,48 @@ impl TaskDone {
             },
 
             TaskDone::Insert { key, serial, version, } => {
-                let db_mirror_value = db_mirror.data.get_mut(&key)
-                    .ok_or_else(|| Error::InsertedValueNotFoundInDbMirror { key: key.clone(), })?;
-                db_mirror_value.commit(key.clone(), serial, version)?;
-                log::debug!(" ;; inserted: {:?}", key);
+                db_mirror.commit_mutation(key.clone(), serial, version)?;
+                // log::debug!(" ;; inserted: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
                 Ok(())
             },
 
             TaskDone::Remove { key, serial, version, } => {
-                let db_mirror_value = db_mirror.data.get_mut(&key)
-                    .ok_or_else(|| Error::RemovedValueNotFoundInDbMirror { key: key.clone(), })?;
-                db_mirror_value.commit(key.clone(), serial, version)?;
-                log::debug!(" ;; removed: {:?}", key);
+                db_mirror.commit_mutation(key.clone(), serial, version)?;
+                // log::debug!(" ;; removed: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
                 Ok(())
             },
 
-            TaskDone::Lookup { key, found_value_cell, } =>
+            TaskDone::Lookup { key, found_value_cell, committed, } => {
                 match found_value_cell {
                     None =>
-                        process_lookup_ready(db_mirror, counter, active_tasks_counter, key, None),
+                        process_lookup_ready(
+                            db_mirror,
+                            counter,
+                            active_tasks_counter,
+                            key,
+                            None,
+                            committed,
+                        ),
                     Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, }) =>
-                        process_lookup_ready(db_mirror, counter, active_tasks_counter, key, Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, })),
+                        process_lookup_ready(
+                            db_mirror,
+                            counter,
+                            active_tasks_counter,
+                            key,
+                            Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, }),
+                            committed,
+                        ),
                     Some(kv::ValueCell { version, cell: kv::Cell::Value(value), }) => {
                         // calculate crc task
                         let calculate_crc_job = CalculateCrcJob {
                             key,
                             found_version: version,
                             found_value: value,
+                            committed,
                         };
                         let thread_pool = thread_pool.clone();
                         spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -1132,10 +1133,19 @@ impl TaskDone {
                         });
                         Ok(())
                     },
+                }
             },
 
-            TaskDone::LookupReady { key, found_value_cell, } =>
-                process_lookup_ready(db_mirror, counter, active_tasks_counter, key, found_value_cell),
+            TaskDone::LookupReady { key, found_value_cell, committed, } => {
+                process_lookup_ready(
+                    db_mirror,
+                    counter,
+                    active_tasks_counter,
+                    key,
+                    found_value_cell,
+                    committed,
+                )
+            },
 
         }
     }
@@ -1147,82 +1157,83 @@ fn process_lookup_ready(
     active_tasks_counter: &mut Counter,
     key: kv::Key,
     maybe_found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
+    committed: bool,
 )
     -> Result<(), Error>
 {
-    let found_value_cell = maybe_found_value_cell
-        .ok_or_else(|| Error::LookupValueNotFound { key: key.clone(), })?;
-    let db_mirror_value = db_mirror.data.get(&key)
-        .ok_or_else(|| Error::LookupValueNotFoundInDbMirror { key: key.clone(), })?;
-    verify_lookup_value(key, db_mirror_value, found_value_cell)?;
+    let mut current_serial = 0;
+    let mut db_mirror_value = db_mirror.data.get(&DbMirrorKey { key: key.clone(), serial: current_serial, })
+        .ok_or_else(|| Error::LookupValueNotFoundInDbMirror { key: (&key).into(), serial: current_serial, })?;
+    let db_mirror_entry = &db_mirror.data_vec[db_mirror_value.db_mirror_entry_index];
+    let serials_count = db_mirror_entry.next_serial;
+    let found = if let Some(found_value_cell) = &maybe_found_value_cell {
+        loop {
+            match (found_value_cell, &db_mirror_value.key_value_crc64_pair.value_cell) {
+                (
+                    kv::ValueCell { version: found_version, cell: found_cell, },
+                    kv::ValueCell { version: snapshot_version, cell: snapshot_cell, },
+                ) if found_version == snapshot_version && found_cell == snapshot_cell =>
+                    break true,
+                (kv::ValueCell { .. }, kv::ValueCell { .. }) =>
+                    (),
+            }
+
+            current_serial += 1;
+            if current_serial >= serials_count {
+                break false;
+            }
+            db_mirror_value = db_mirror.data.get(&DbMirrorKey { key: key.clone(), serial: current_serial, })
+                .ok_or_else(|| Error::LookupValueNotFoundInDbMirror { key: (&key).into(), serial: current_serial, })?;
+        }
+    } else if !committed {
+        log::warn!("skipping lookup not found result on uncommitted db mirror value for {:?}", &key.key_bytes[..]);
+        true
+    } else {
+        false
+    };
+
+    if found {
+        // log::debug!(" ;; looked up: {:?}", &key.key_bytes[..]);
+    } else {
+        let mut snapshots = Vec::with_capacity(serials_count);
+        for serial in 0 .. serials_count {
+            let db_mirror_value = db_mirror.data.get(&DbMirrorKey { key: key.clone(), serial, }).unwrap();
+            snapshots.push((serial, db_mirror_value.key_value_crc64_pair.value_cell.clone()));
+        }
+
+        return Err(Error::LookupValueDoesNotMatchDbMirror {
+            key: key.into(),
+            found_value_cell: maybe_found_value_cell,
+            serials_count,
+            snapshots,
+        });
+    }
 
     counter.lookups += 1;
     active_tasks_counter.lookups -= 1;
-    todo!()
+    Ok(())
 }
 
-fn verify_lookup_value(key: kv::Key, db_mirror_value: &DbMirrorValue, found_value_cell: kv::ValueCell<ValueCrc64>) -> Result<(), Error> {
-    // first check actual snapshot
-    match (&db_mirror_value.snapshot, &found_value_cell) {
-        (
-            Some(Mutation {
-                key_value_crc64_pair: kv::KeyValuePair {
-                    value_cell: kv::ValueCell {
-                        version: snapshot_version,
-                        cell: snapshot_cell,
-                    },
-                    ..
-                },
-                ..
-            }),
-            kv::ValueCell {
-                version: found_version,
-                cell: found_cell,
-            },
-        ) if snapshot_version == found_version && snapshot_cell == found_cell =>
-            return Ok(()),
-        (Some(Mutation { .. }), kv::ValueCell { .. }) |
-        (None, kv::ValueCell { .. }) =>
-            (),
-    }
+pub struct DebugKey {
+    key: kv::Key,
+}
 
-    for mutation in &db_mirror_value.mutations {
-        match (mutation, &found_value_cell) {
-            (
-                Mutation {
-                    key_value_crc64_pair: kv::KeyValuePair {
-                        value_cell: kv::ValueCell {
-                            version: snapshot_version,
-                            cell: snapshot_cell,
-                        },
-                        ..
-                    },
-                    ..
-                },
-                kv::ValueCell {
-                    version: found_version,
-                    cell: found_cell,
-                },
-            ) if snapshot_version == found_version && snapshot_cell == found_cell =>
-                return Ok(()),
-            (
-                Mutation {
-                    key_value_crc64_pair: kv::KeyValuePair {
-                        value_cell: kv::ValueCell {
-                            version: 0,
-                            cell: snapshot_cell,
-                        },
-                        ..
-                    },
-                    ..
-                },
-                kv::ValueCell { cell: found_cell, .. },
-            ) if snapshot_cell == found_cell =>
-                return Ok(()),
-            (Mutation { .. }, kv::ValueCell { .. }) =>
-                (),
-        }
+impl<'a> From<&'a kv::Key> for DebugKey {
+    fn from(key: &'a kv::Key) -> DebugKey {
+        DebugKey { key: key.clone(), }
     }
+}
 
-    Err(Error::LookupValueDoesNotMatchDbMirror { key, found_value_cell, })
+impl From<kv::Key> for DebugKey {
+    fn from(key: kv::Key) -> DebugKey {
+        DebugKey { key, }
+    }
+}
+
+impl fmt::Debug for DebugKey {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_tuple("kv::Key")
+            .field(&&self.key.key_bytes[..])
+            .finish()
+    }
 }
