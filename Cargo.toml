@@ -1,6 +1,6 @@
 [package]
 name = "ero-blockwheel-kv-bench"
-version = "0.3.3"
+version = "0.3.5"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Benchmark utility for key/value persistent store `ero-blockwheel-kv`."
 edition = "2018"

@@ -106,7 +106,7 @@ struct Config {
 pub enum Error {
     ConfigRead(io::Error),
     ConfigParse(toml::de::Error),
-    // SledInvalidMode { mode_provided: String, },
+    SledInvalidMode { mode_provided: String, },
     TokioRuntime(io::Error),
     ThreadPool(edeltraud::BuildError),
     Edeltraud(edeltraud::SpawnError),
@@ -129,33 +129,20 @@ pub enum Error {
     BlockwheelKvRemove(blockwheel_kv_ero::RemoveError),
     BlockwheelKvLookup(blockwheel_kv_ero::LookupError),
     BlockwheelKvFlush(blockwheel_kv_ero::FlushError),
-    // Sled(sled::Error),
-    // GenTaskJoin(tokio::task::JoinError),
-    // Insert(blockwheel_kv_ero::InsertError),
-    // InsertSled(sled::Error),
-    // InsertTaskJoin(tokio::task::JoinError),
-    // Lookup(blockwheel_kv_ero::LookupError),
-    // LookupSled(sled::Error),
-    // LookupTaskJoin(tokio::task::JoinError),
-    // LookupRange(blockwheel_kv_ero::LookupRangeError),
-    // LookupRangeSledNext(sled::Error),
-    // LookupRangeSledLast(sled::Error),
-    // Remove(blockwheel_kv_ero::RemoveError),
-    // RemoveSled(sled::Error),
-    // RemoveTaskJoin(tokio::task::JoinError),
-    // Flush(blockwheel_kv_ero::FlushError),
-    // FlushSled(sled::Error),
-    // InsertTimedOut { key: kv::Key, },
-    // InsertTimedOutNoKey,
-    // LookupTimedOut { key: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
-    // LookupRangeTimedOut { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
-    // LookupRangeTimedOutInit { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
-    // LookupRangeTimedOutFirst { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
-    // LookupRangeTimedOutLast { key_from: kv::Key, key_to: kv::Key, value_cell: kv::ValueCell<kv::Value>, },
-    // RemoveTimedOut { key: kv::Key, },
+    Sled(sled::Error),
+    InsertSled(sled::Error),
+    InsertTaskJoin(tokio::task::JoinError),
+    LookupSled(sled::Error),
+    LookupTaskJoin(tokio::task::JoinError),
+    RemoveSled(sled::Error),
+    RemoveTaskJoin(tokio::task::JoinError),
+    FlushSled(sled::Error),
+    InsertTimedOutNoKey,
+    LookupTimedOut { key: DebugKey, },
+    RemoveTimedOut { key: DebugKey, },
     FlushTimedOut,
-    // SledSerialize(bincode::Error),
-    // SledDeserialize(bincode::Error),
+    SledSerialize(bincode::Error),
+    SledDeserialize(bincode::Error),
     WheelsBuilder(wheels::Error),
 }
 
@@ -191,7 +178,7 @@ fn main() -> Result<(), Error> {
         },
         BackendCmd::Sled => {
             fs::remove_dir_all(&config.sled.directory).ok();
-            // runtime.block_on(run_sled(blocks_pool, config.clone(), &mut data, &mut counter))?;
+            runtime.block_on(run_sled(blocks_pool, config, &mut db_mirror, &mut counter))?;
         },
     }
 
@@ -300,49 +287,54 @@ async fn run_blockwheel_kv(
     Ok(())
 }
 
-// async fn run_sled(
-//     config: Config,
-//     data: &mut DataIndex,
-//     counter: &mut Counter,
-// )
-//     -> Result<(), Error>
-// {
-//     let supervisor_gen_server = SupervisorGenServer::new();
-//     let mut supervisor_pid = supervisor_gen_server.pid();
-//     tokio::spawn(supervisor_gen_server.run());
+async fn run_sled(
+    blocks_pool: BytesPool,
+    config: Config,
+    db_mirror: &mut DbMirror,
+    counter: &mut Counter,
+)
+    -> Result<(), Error>
+{
+    let supervisor_gen_server = SupervisorGenServer::new();
+    let mut supervisor_pid = supervisor_gen_server.pid();
+    tokio::spawn(supervisor_gen_server.run());
 
-//     let blocks_pool = BytesPool::new();
-//     let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
+    let thread_pool: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
+        .worker_threads(config.edeltraud.worker_threads)
+        .build()
+        .map_err(Error::ThreadPool)?;
+    let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
 
-//     let sled_tree = sled::Config::new()
-//         .path(&config.sled.directory)
-//         .cache_capacity(config.sled.cache_capacity)
-//         .mode(match &*config.sled.mode {
-//             "fast" =>
-//                 sled::Mode::HighThroughput,
-//             "small" =>
-//                 sled::Mode::LowSpace,
-//             other =>
-//                 return Err(Error::SledInvalidMode { mode_provided: other.to_string(), }),
-//         })
-//         .print_profile_on_drop(config.sled.print_profile_on_drop)
-//         .open()
-//         .map_err(Error::Sled)?;
+    let sled_tree = sled::Config::new()
+        .path(&config.sled.directory)
+        .cache_capacity(config.sled.cache_capacity)
+        .mode(match &*config.sled.mode {
+            "fast" =>
+                sled::Mode::HighThroughput,
+            "small" =>
+                sled::Mode::LowSpace,
+            other =>
+                return Err(Error::SledInvalidMode { mode_provided: other.to_string(), }),
+        })
+        .print_profile_on_drop(config.sled.print_profile_on_drop)
+        .open()
+        .map_err(Error::Sled)?;
 
-//     stress_loop(
-//         &mut supervisor_pid,
-//         Backend::Sled {
-//             database: Arc::new(sled_tree),
-//         },
-//         &blocks_pool,
-//         &version_provider,
-//         data,
-//         counter,
-//         &config.bench,
-//     ).await?;
+    stress_loop(
+        &mut supervisor_pid,
+        Backend::Sled {
+            database: Arc::new(sled_tree),
+        },
+        db_mirror,
+        &blocks_pool,
+        &version_provider,
+        counter,
+        Arc::new(config.bench),
+        &thread_pool,
+    ).await?;
 
-//     Ok(())
-// }
+    Ok(())
+}
 
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -479,6 +471,7 @@ enum Backend {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stress_loop<P>(
     supervisor_pid: &mut SupervisorPid,
     mut backend: Backend,
@@ -639,21 +632,22 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
     Ok(())
 }
 
-// #[derive(Serialize, Deserialize)]
-// struct SledEntry<'a> {
-//     version: u64,
-//     #[serde(borrow)]
-//     value: SledValue<'a>,
-// }
+#[derive(Serialize, Deserialize)]
+struct SledEntry<'a> {
+    version: u64,
+    #[serde(borrow)]
+    value: SledValue<'a>,
+}
 
-// #[derive(Serialize, Deserialize)]
-// enum SledValue<'a> {
-//     Value { data: &'a [u8], },
-//     Tombstone,
-// }
+#[derive(Serialize, Deserialize)]
+enum SledValue<'a> {
+    Value { data: &'a [u8], },
+    Tombstone,
+}
 
 impl Backend {
-    fn spawn_insert_task<P>(
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_insert_task(
         &mut self,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
@@ -663,9 +657,7 @@ impl Backend {
         value_block: Bytes,
         serial: usize,
         limits: &toml_config::Bench,
-        thread_pool: &P,
     )
-    where P: edeltraud::ThreadPool<Job> + Clone
     {
         match self {
             Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
@@ -678,46 +670,33 @@ impl Backend {
                 });
             },
             Backend::Sled { database, } => {
-//                 let database = database.clone();
-//                 let blocks_pool = blocks_pool.clone();
-//                 let version_provider = version_provider.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let insert_task = tokio::task::spawn_blocking(move || {
-//                         let mut key_block = blocks_pool.lend();
-//                         let mut value_block = blocks_pool.lend();
-//                         let mut rng = SmallRng::from_entropy();
-//                         key_block.reserve(key_amount);
-//                         for _ in 0 .. key_amount {
-//                             key_block.push(rng.gen());
-//                         }
-//                         value_block.reserve(value_amount);
-//                         for _ in 0 .. value_amount {
-//                             value_block.push(rng.gen());
-//                         }
-//                         let mut sled_value_block = blocks_pool.lend();
-//                         let version = version_provider.obtain();
-//                         bincode::serialize_into(&mut **sled_value_block, &SledEntry {
-//                             version,
-//                             value: SledValue::Value { data: &value_block, },
-//                         }).map_err(Error::SledSerialize)?;
-//                         let key = kv::Key { key_bytes: key_block.freeze(), };
-//                         database.insert(&*key.key_bytes, &***sled_value_block)
-//                             .map_err(Error::InsertSled)?;
-//                         let value = kv::Value { value_bytes: value_block.freeze(), };
-//                         Ok(TaskDone::Insert { key, value, version, })
-//                     });
-//                     match tokio::time::timeout(op_timeout, insert_task).await {
-//                         Ok(Ok(Ok(task_done))) =>
-//                             Ok(task_done),
-//                         Ok(Ok(Err(error))) =>
-//                             Err(error),
-//                         Ok(Err(error)) =>
-//                             Err(Error::InsertTaskJoin(error)),
-//                         Err(..) =>
-//                             Err(Error::InsertTimedOutNoKey),
-//                     }
-//                 });
+                let database = database.clone();
+                let blocks_pool = blocks_pool.clone();
+                let version_provider = version_provider.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_insert_secs);
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let insert_task = tokio::task::spawn_blocking(move || {
+                        let mut sled_value_block = blocks_pool.lend();
+                        let version = version_provider.obtain();
+                        bincode::serialize_into(&mut **sled_value_block, &SledEntry {
+                            version,
+                            value: SledValue::Value { data: &value_block, },
+                        }).map_err(Error::SledSerialize)?;
+                        database.insert(&*key.key_bytes, &***sled_value_block)
+                            .map_err(Error::InsertSled)?;
+                        Ok(TaskDone::Insert { key, serial, version, })
+                    });
+                    match tokio::time::timeout(op_timeout, insert_task).await {
+                        Ok(Ok(Ok(task_done))) =>
+                            Ok(task_done),
+                        Ok(Ok(Err(error))) =>
+                            Err(error),
+                        Ok(Err(error)) =>
+                            Err(Error::InsertTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::InsertTimedOutNoKey),
+                    }
+                });
             },
         }
     }
@@ -740,83 +719,59 @@ impl Backend {
                         .map_err(Error::BlockwheelKvLookup)?;
                     Ok(TaskDone::Lookup { key, found_value_cell, committed, })
                 });
-//                 let mut wheel_kv_pid = wheel_kv_pid.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let lookup_task = tokio::time::timeout(
-//                         op_timeout,
-//                         wheel_kv_pid.lookup(key.clone()),
-//                     );
-//                     match lookup_task.await {
-//                         Ok(Ok(found_value_cell)) =>
-//                             Ok(TaskDone::Lookup {
-//                                 key,
-//                                 found_value_cell,
-//                                 version_snapshot: value_cell.version,
-//                                 lookup_kind: LookupKind::Single,
-//                             }),
-//                         Ok(Err(error)) =>
-//                             Err(Error::Lookup(error)),
-//                         Err(..) =>
-//                             Err(Error::LookupTimedOut { key, value_cell, }),
-//                     }
-//                 });
             },
             Backend::Sled { database, } => {
-
-                todo!()
-//                 let database = database.clone();
-//                 let blocks_pool = blocks_pool.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let sled_key = key.key_bytes.clone();
-//                     let lookup_task = tokio::task::spawn_blocking(move || {
-//                         database.get(&*sled_key)
-//                     });
-//                     match tokio::time::timeout(op_timeout, lookup_task).await {
-//                         Ok(Ok(Ok(None))) =>
-//                             Err(Error::ExpectedValueNotFound { key, lookup_kind: LookupKind::Single, }),
-//                         Ok(Ok(Ok(Some(bin)))) => {
-//                             let sled_entry: SledEntry<'_> = bincode::deserialize(&bin)
-//                                 .map_err(Error::SledDeserialize)?;
-//                             match sled_entry.value {
-//                                 SledValue::Value { data, } => {
-//                                     let mut value_block = blocks_pool.lend();
-//                                     value_block.extend_from_slice(data);
-//                                     Ok(TaskDone::Lookup {
-//                                         key,
-//                                         found_value_cell: Some(kv::ValueCell {
-//                                             version: sled_entry.version,
-//                                             cell: kv::Cell::Value(value_block.into()),
-//                                         }),
-//                                         version_snapshot: value_cell.version,
-//                                         lookup_kind: LookupKind::Single,
-//                                     })
-//                                 },
-//                                 SledValue::Tombstone =>
-//                                     Ok(TaskDone::Lookup {
-//                                         key,
-//                                         found_value_cell: Some(kv::ValueCell {
-//                                             version: sled_entry.version,
-//                                             cell: kv::Cell::Tombstone,
-//                                         }),
-//                                         version_snapshot: value_cell.version,
-//                                         lookup_kind: LookupKind::Single,
-//                                     }),
-//                             }
-//                         },
-//                         Ok(Ok(Err(error))) =>
-//                             Err(Error::LookupSled(error)),
-//                         Ok(Err(error)) =>
-//                             Err(Error::LookupTaskJoin(error)),
-//                         Err(..) =>
-//                             Err(Error::LookupTimedOut { key, value_cell, }),
-//                     }
-//                 });
+                let database = database.clone();
+                let blocks_pool = blocks_pool.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_lookup_secs);
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let sled_key = key.key_bytes.clone();
+                    let lookup_task = tokio::task::spawn_blocking(move || {
+                        database.get(&*sled_key)
+                    });
+                    match tokio::time::timeout(op_timeout, lookup_task).await {
+                        Ok(Ok(Ok(None))) =>
+                            Ok(TaskDone::Lookup { key, found_value_cell: None, committed, }),
+                        Ok(Ok(Ok(Some(bin)))) => {
+                            let sled_entry: SledEntry<'_> = bincode::deserialize(&bin)
+                                .map_err(Error::SledDeserialize)?;
+                            match sled_entry.value {
+                                SledValue::Value { data, } => {
+                                    let mut value_block = blocks_pool.lend();
+                                    value_block.extend_from_slice(data);
+                                    Ok(TaskDone::Lookup {
+                                        key,
+                                        found_value_cell: Some(kv::ValueCell {
+                                            version: sled_entry.version,
+                                            cell: kv::Cell::Value(value_block.into()),
+                                        }),
+                                        committed,
+                                    })
+                                },
+                                SledValue::Tombstone =>
+                                    Ok(TaskDone::Lookup {
+                                        key,
+                                        found_value_cell: Some(kv::ValueCell {
+                                            version: sled_entry.version,
+                                            cell: kv::Cell::Tombstone,
+                                        }),
+                                        committed,
+                                    }),
+                            }
+                        },
+                        Ok(Ok(Err(error))) =>
+                            Err(Error::LookupSled(error)),
+                        Ok(Err(error)) =>
+                            Err(Error::LookupTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::LookupTimedOut { key: key.into(), }),
+                    }
+                });
             },
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_remove_task(
         &mut self,
         supervisor_pid: &mut SupervisorPid,
@@ -838,34 +793,32 @@ impl Backend {
                 });
             },
             Backend::Sled { database, } => {
-
-                todo!()
-//                 let database = database.clone();
-//                 let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
-//                 let blocks_pool = blocks_pool.clone();
-//                 let version_provider = version_provider.clone();
-//                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-//                     let sled_key = key.clone();
-//                     let remove_task = tokio::task::spawn_blocking(move || {
-//                         let mut sled_value_block = blocks_pool.lend();
-//                         let version = version_provider.obtain();
-//                         bincode::serialize_into(&mut **sled_value_block, &SledEntry {
-//                             version,
-//                             value: SledValue::Tombstone,
-//                         }).map_err(Error::SledSerialize)?;
-//                         database.insert(&*sled_key.key_bytes, &***sled_value_block)
-//                             .map_err(Error::RemoveSled)
-//                             .map(|_| TaskDone::Remove { key: sled_key, version, })
-//                     });
-//                     match tokio::time::timeout(op_timeout, remove_task).await {
-//                         Ok(Ok(result)) =>
-//                             result,
-//                         Ok(Err(error)) =>
-//                             Err(Error::RemoveTaskJoin(error)),
-//                         Err(..) =>
-//                             Err(Error::RemoveTimedOut { key, }),
-//                     }
-//                 });
+                let database = database.clone();
+                let op_timeout = Duration::from_secs(limits.timeout_remove_secs);
+                let blocks_pool = blocks_pool.clone();
+                let version_provider = version_provider.clone();
+                spawn_task(supervisor_pid, done_tx.clone(), async move {
+                    let sled_key = key.clone();
+                    let remove_task = tokio::task::spawn_blocking(move || {
+                        let mut sled_value_block = blocks_pool.lend();
+                        let version = version_provider.obtain();
+                        bincode::serialize_into(&mut **sled_value_block, &SledEntry {
+                            version,
+                            value: SledValue::Tombstone,
+                        }).map_err(Error::SledSerialize)?;
+                        database.insert(&*sled_key.key_bytes, &***sled_value_block)
+                            .map_err(Error::RemoveSled)
+                            .map(|_| TaskDone::Remove { key: sled_key, serial, version, })
+                    });
+                    match tokio::time::timeout(op_timeout, remove_task).await {
+                        Ok(Ok(result)) =>
+                            result,
+                        Ok(Err(error)) =>
+                            Err(Error::RemoveTaskJoin(error)),
+                        Err(..) =>
+                            Err(Error::RemoveTimedOut { key: key.into(), }),
+                    }
+                });
             },
         }
     }
@@ -884,21 +837,20 @@ impl Backend {
                 log::info!("blockwheel_kv flushed");
             },
             Backend::Sled { database, } => {
-
-                todo!()
-//                 let flush_task = tokio::time::timeout(
-//                     op_timeout,
-//                     database.flush_async(),
-//                 );
-//                 flush_task.await
-//                     .map_err(|_| Error::FlushTimedOut)
-//                     .and_then(|result| result.map_err(Error::FlushSled))?;
+                let flush_task = tokio::time::timeout(
+                    op_timeout,
+                    database.flush_async(),
+                );
+                flush_task.await
+                    .map_err(|_| Error::FlushTimedOut)
+                    .and_then(|result| result.map_err(Error::FlushSled))?;
             },
         }
         Ok(())
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Job {
     BlockwheelKvEro(blockwheel_kv_ero::job::Job),
     PrepareInsert(edeltraud::AsyncJob<PrepareInsertJob>),
@@ -1034,6 +986,7 @@ where T: Future<Output = Result<TaskDone, Error>> + Send + 'static
 }
 
 impl TaskDone {
+    #[allow(clippy::too_many_arguments)]
     fn process<P>(
         self,
         backend: &mut Backend,
@@ -1075,13 +1028,12 @@ impl TaskDone {
                     value_block,
                     serial,
                     limits,
-                    thread_pool,
                 );
                 Ok(())
             },
 
             TaskDone::Insert { key, serial, version, } => {
-                db_mirror.commit_mutation(key.clone(), serial, version)?;
+                db_mirror.commit_mutation(key, serial, version)?;
                 // log::debug!(" ;; inserted: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
@@ -1089,7 +1041,7 @@ impl TaskDone {
             },
 
             TaskDone::Remove { key, serial, version, } => {
-                db_mirror.commit_mutation(key.clone(), serial, version)?;
+                db_mirror.commit_mutation(key, serial, version)?;
                 // log::debug!(" ;; removed: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
@@ -1166,6 +1118,7 @@ fn process_lookup_ready(
         .ok_or_else(|| Error::LookupValueNotFoundInDbMirror { key: (&key).into(), serial: current_serial, })?;
     let db_mirror_entry = &db_mirror.data_vec[db_mirror_value.db_mirror_entry_index];
     let serials_count = db_mirror_entry.next_serial;
+    let mut found_uncommitted = false;
     let found = if let Some(found_value_cell) = &maybe_found_value_cell {
         loop {
             match (found_value_cell, &db_mirror_value.key_value_crc64_pair.value_cell) {
@@ -1174,6 +1127,11 @@ fn process_lookup_ready(
                     kv::ValueCell { version: snapshot_version, cell: snapshot_cell, },
                 ) if found_version == snapshot_version && found_cell == snapshot_cell =>
                     break true,
+                (
+                    kv::ValueCell { cell: found_cell, .. },
+                    kv::ValueCell { version: 0, cell: snapshot_cell, },
+                ) if found_cell == snapshot_cell =>
+                    found_uncommitted = true,
                 (kv::ValueCell { .. }, kv::ValueCell { .. }) =>
                     (),
             }
@@ -1194,6 +1152,8 @@ fn process_lookup_ready(
 
     if found {
         // log::debug!(" ;; looked up: {:?}", &key.key_bytes[..]);
+    } else if found_uncommitted {
+        log::warn!("skipping lookup uncommitted result found for {:?}", &key.key_bytes[..]);
     } else {
         let mut snapshots = Vec::with_capacity(serials_count);
         for serial in 0 .. serials_count {
