@@ -1,0 +1,19 @@
+tree_block_size = 2048
+
+512  parallel: 131s / 244s
+1024 parallel: 119s / 246s
+2048 parallel: 126s / 242s
+3072 parallel: 131s / 247s
+4096 parallel: 134s / 261s
+6144 parallel: 154s / 275s
+8192 parallel: 149s / 268s
+
+active_tasks = 1024
+
+1024 block size: 163s / 289s
+1536 block size: 143s / 259s
+2048 block size: 119s / 246s
+2560 block size: 116s / 251s
+3072 block size: 117s / 229s
+3584 block size: 117s / 235s
+4096 block size: 121s / 244s
