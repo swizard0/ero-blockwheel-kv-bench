@@ -17,3 +17,10 @@ active_tasks = 1024
 3072 block size: 117s / 229s
 3584 block size: 117s / 235s
 4096 block size: 121s / 244s
+
+// round table edeltraud
+
+1024 parallel | 2560 block size: 78s / 149s
+2048 parallel | 2560 block size: 86s / 176s
+4096 parallel | 2560 block size: 82s / 165s
+4096 parallel | 4096 block size: 95s / 185s
