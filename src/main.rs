@@ -227,7 +227,8 @@ async fn run_blockwheel_kv(
         let blockwheel_filename = match &blockwheel_fs_params.interpreter {
             blockwheel_fs::InterpreterParams::FixedFile(interpreter_params) =>
                 interpreter_params.wheel_filename.clone(),
-            blockwheel_fs::InterpreterParams::Ram(..) => {
+            blockwheel_fs::InterpreterParams::Ram(..) |
+            blockwheel_fs::InterpreterParams::Dummy(..) => {
                 ('a' ..= 'z')
                     .choose_multiple(&mut rand::thread_rng(), 16)
                     .into_iter()

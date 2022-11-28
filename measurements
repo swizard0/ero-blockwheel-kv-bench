@@ -24,3 +24,20 @@ active_tasks = 1024
 2048 parallel | 2560 block size: 86s / 176s
 4096 parallel | 2560 block size: 82s / 165s
 4096 parallel | 4096 block size: 95s / 185s
+
+// round table edeltraud, less locks
+
+1024 parallel | 2560 block size: 77s / 150s
+
+// round table edeltraud, non-blocking spawn
+
+1024 parallel | 2560 block size: 78s / 172s
+1024 parallel | 8192 block size: 81s / 168s
+4096 parallel | 2560 block size: 91s / 165s
+4096 parallel | 4096 block size: 96s / 175s
+
+// little blocking arbeitssklave
+1024 parallel | 2560 block size: 79s / 138s
+1024 parallel | 8192 block size: 88s / 142s
+2048 parallel | 2560 block size: 83s / 136s
+4096 parallel | 4096 block size: 96s / 153s
