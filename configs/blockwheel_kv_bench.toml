@@ -3,9 +3,9 @@
 # blockwheel_kv key-value database related parameters
 [blockwheel_kv]
 # butcher task restart timeout (seconds) for blockwheel kv storage
-butcher_block_size = 4608
+butcher_block_size = 4092
 # blockwheel kv storage n-tree block size
-tree_block_size = 1536
+tree_block_size = 2560
 # mpsc channel send buffer before backpressure for iterators in blockwheel kv storage
 iter_send_buffer = 0
 # manager task restart timeout (seconds) for blockwheel kv storage
@@ -55,10 +55,10 @@ print_profile_on_drop = true
 [bench]
 # maximum number of parallel kv access tasks
 # active_tasks = 3072
-active_tasks = 8192
+active_tasks = 1024
 # total number of actions with kv database
 # actions = 131072
-actions = 1048576
+actions = 2097152
 # maximum key size in bytes
 key_size_bytes = 32
 # maximum value size in bytes
@@ -92,4 +92,4 @@ thread_keep_alive_ms = 10000
 # edeltraud thread pool related parameters
 [edeltraud]
 # sets the number of threads to be used in the edeltraud threadpool
-worker_threads = 4
+worker_threads = 8

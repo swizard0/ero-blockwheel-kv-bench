@@ -1,9 +1,9 @@
 [package]
 name = "ero-blockwheel-kv-bench"
-version = "0.3.6"
+version = "0.3.7"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Benchmark utility for key/value persistent store `ero-blockwheel-kv`."
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 ero = { git = "https://github.com/swizard0/ero.git" }

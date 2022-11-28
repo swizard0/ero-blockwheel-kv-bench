@@ -9,6 +9,7 @@ use std::{
         Duration,
     },
     sync::{
+        atomic,
         Arc,
     },
     path::{
@@ -73,6 +74,13 @@ use blockwheel_fs::{
 };
 
 mod toml_config;
+
+pub static TOTAL_INSERTS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+pub static TOTAL_INSERTS_MS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+pub static TOTAL_REMOVES: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+pub static TOTAL_REMOVES_MS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+pub static TOTAL_LOOKUPS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+pub static TOTAL_LOOKUPS_MS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
 #[derive(Clone, Parser, Debug)]
 #[clap(setting = AppSettings::DeriveDisplayOrder)]
@@ -181,6 +189,30 @@ fn main() -> Result<(), Error> {
             runtime.block_on(run_sled(blocks_pool, config, &mut db_mirror, &mut counter))?;
         },
     }
+
+    let total_inserts = TOTAL_INSERTS.load(atomic::Ordering::Relaxed);
+    let total_inserts_ms = TOTAL_INSERTS_MS.load(atomic::Ordering::Relaxed);
+    log::info!(
+        "TOTAL_INSERTS: {total_inserts}, TOTAL_INSERTS TIME: {:?}, AVG_INSERT TIME: {:?}",
+        Duration::from_micros(total_inserts_ms as u64),
+        Duration::from_micros((total_inserts_ms / total_inserts) as u64),
+    );
+
+    let total_removes = TOTAL_REMOVES.load(atomic::Ordering::Relaxed);
+    let total_removes_ms = TOTAL_REMOVES_MS.load(atomic::Ordering::Relaxed);
+    log::info!(
+        "TOTAL_REMOVES: {total_removes}, TOTAL_REMOVES TIME: {:?}, AVG_REMOVE TIME: {:?}",
+        Duration::from_micros(total_removes_ms as u64),
+        Duration::from_micros((total_removes_ms / total_removes) as u64),
+    );
+
+    let total_lookups = TOTAL_LOOKUPS.load(atomic::Ordering::Relaxed);
+    let total_lookups_ms = TOTAL_LOOKUPS_MS.load(atomic::Ordering::Relaxed);
+    log::info!(
+        "TOTAL_LOOKUPS: {total_lookups}, TOTAL_LOOKUPS TIME: {:?}, AVG_LOOKUP TIME: {:?}",
+        Duration::from_micros(total_lookups_ms as u64),
+        Duration::from_micros((total_lookups_ms / total_lookups) as u64),
+    );
 
     Ok(())
 }
@@ -547,6 +579,7 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
             continue;
         }
 
+        let action_start = Instant::now();
         // construct action and run task
         if db_mirror.data_vec.is_empty() || rng.sample(p_distribution) < limits.insert_or_remove_prob {
             // insert or remove task
@@ -558,6 +591,7 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
                 let prepare_insert_job = PrepareInsertJob {
                     huge_random_block: db_mirror.huge_random_block.clone(),
                     limits: limits.clone(),
+                    action_start,
                 };
                 let thread_pool = thread_pool.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -591,6 +625,7 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
                     db_mirror_entry.key,
                     serial,
                     &limits,
+                    action_start,
                 );
                 active_tasks_counter.removes += 1;
             }
@@ -616,6 +651,7 @@ where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
                 db_mirror_entry.key.clone(),
                 db_mirror_entry.committed,
                 &limits,
+                action_start,
             );
             active_tasks_counter.lookups += 1;
         }
@@ -658,6 +694,7 @@ impl Backend {
         value_block: Bytes,
         serial: usize,
         limits: &toml_config::Bench,
+        action_start: Instant,
     )
     {
         match self {
@@ -667,7 +704,7 @@ impl Backend {
                     let value = kv::Value { value_bytes: value_block, };
                     let blockwheel_kv_ero::Inserted { version, } = blockwheel_kv_pid.insert(key.clone(), value).await
                         .map_err(Error::BlockwheelKvInsert)?;
-                    Ok(TaskDone::Insert { key, serial, version, })
+                    Ok(TaskDone::Insert { key, serial, version, action_start, })
                 });
             },
             Backend::Sled { database, } => {
@@ -685,7 +722,7 @@ impl Backend {
                         }).map_err(Error::SledSerialize)?;
                         database.insert(&*key.key_bytes, &***sled_value_block)
                             .map_err(Error::InsertSled)?;
-                        Ok(TaskDone::Insert { key, serial, version, })
+                        Ok(TaskDone::Insert { key, serial, version, action_start, })
                     });
                     match tokio::time::timeout(op_timeout, insert_task).await {
                         Ok(Ok(Ok(task_done))) =>
@@ -702,6 +739,7 @@ impl Backend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_lookup_task(
         &mut self,
         supervisor_pid: &mut SupervisorPid,
@@ -710,6 +748,7 @@ impl Backend {
         key: kv::Key,
         committed: bool,
         limits: &toml_config::Bench,
+        action_start: Instant,
     )
     {
         match self {
@@ -718,7 +757,7 @@ impl Backend {
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let found_value_cell = blockwheel_kv_pid.lookup(key.clone()).await
                         .map_err(Error::BlockwheelKvLookup)?;
-                    Ok(TaskDone::Lookup { key, found_value_cell, committed, })
+                    Ok(TaskDone::Lookup { key, found_value_cell, committed, action_start, })
                 });
             },
             Backend::Sled { database, } => {
@@ -732,7 +771,7 @@ impl Backend {
                     });
                     match tokio::time::timeout(op_timeout, lookup_task).await {
                         Ok(Ok(Ok(None))) =>
-                            Ok(TaskDone::Lookup { key, found_value_cell: None, committed, }),
+                            Ok(TaskDone::Lookup { key, found_value_cell: None, committed, action_start, }),
                         Ok(Ok(Ok(Some(bin)))) => {
                             let sled_entry: SledEntry<'_> = bincode::deserialize(&bin)
                                 .map_err(Error::SledDeserialize)?;
@@ -747,6 +786,7 @@ impl Backend {
                                             cell: kv::Cell::Value(value_block.into()),
                                         }),
                                         committed,
+                                        action_start,
                                     })
                                 },
                                 SledValue::Tombstone =>
@@ -757,6 +797,7 @@ impl Backend {
                                             cell: kv::Cell::Tombstone,
                                         }),
                                         committed,
+                                        action_start,
                                     }),
                             }
                         },
@@ -782,6 +823,7 @@ impl Backend {
         key: kv::Key,
         serial: usize,
         limits: &toml_config::Bench,
+        action_start: Instant,
     )
     {
         match self {
@@ -790,7 +832,7 @@ impl Backend {
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let blockwheel_kv_ero::Removed { version, } = blockwheel_kv_pid.remove(key.clone()).await
                         .map_err(Error::BlockwheelKvRemove)?;
-                    Ok(TaskDone::Remove { key, serial, version, })
+                    Ok(TaskDone::Remove { key, serial, version, action_start, })
                 });
             },
             Backend::Sled { database, } => {
@@ -809,7 +851,7 @@ impl Backend {
                         }).map_err(Error::SledSerialize)?;
                         database.insert(&*sled_key.key_bytes, &***sled_value_block)
                             .map_err(Error::RemoveSled)
-                            .map(|_| TaskDone::Remove { key: sled_key, serial, version, })
+                            .map(|_| TaskDone::Remove { key: sled_key, serial, version, action_start, })
                     });
                     match tokio::time::timeout(op_timeout, remove_task).await {
                         Ok(Ok(result)) =>
@@ -895,6 +937,7 @@ impl edeltraud::Job for Job {
 struct PrepareInsertJob {
     huge_random_block: Bytes,
     limits: Arc<toml_config::Bench>,
+    action_start: Instant,
 }
 
 impl edeltraud::Computation for PrepareInsertJob {
@@ -917,7 +960,7 @@ impl edeltraud::Computation for PrepareInsertJob {
 
         let value_crc64 = ValueCrc64(block::crc(&value_block));
 
-        Ok(TaskDone::PrepareInsert { key_block, value_block, value_crc64, })
+        Ok(TaskDone::PrepareInsert { key_block, value_block, value_crc64, action_start: self.action_start, })
     }
 }
 
@@ -926,6 +969,7 @@ struct CalculateCrcJob {
     found_version: u64,
     found_value: kv::Value,
     committed: bool,
+    action_start: Instant,
 }
 
 impl edeltraud::Computation for CalculateCrcJob {
@@ -940,6 +984,7 @@ impl edeltraud::Computation for CalculateCrcJob {
                 cell: kv::Cell::Value(value_crc64),
             }),
             committed: self.committed,
+            action_start: self.action_start,
         })
     }
 }
@@ -950,26 +995,31 @@ enum TaskDone {
         key_block: Bytes,
         value_block: Bytes,
         value_crc64: ValueCrc64,
+        action_start: Instant,
     },
     Insert {
         key: kv::Key,
         serial: usize,
         version: u64,
+        action_start: Instant,
     },
     Remove {
         key: kv::Key,
         serial: usize,
         version: u64,
+        action_start: Instant,
     },
     Lookup {
         key: kv::Key,
         found_value_cell: Option<kv::ValueCell<kv::Value>>,
         committed: bool,
+        action_start: Instant,
     },
     LookupReady {
         key: kv::Key,
         found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
         committed: bool,
+        action_start: Instant,
     },
 }
 
@@ -1007,7 +1057,7 @@ impl TaskDone {
     {
         match self {
 
-            TaskDone::PrepareInsert { key_block, value_block, value_crc64 } => {
+            TaskDone::PrepareInsert { key_block, value_block, value_crc64, action_start, } => {
                 let key = kv::Key { key_bytes: key_block, };
                 let serial = db_mirror.enqueue_mutation(key.clone(), kv::Cell::Value(value_crc64));
 
@@ -1029,27 +1079,32 @@ impl TaskDone {
                     value_block,
                     serial,
                     limits,
+                    action_start,
                 );
                 Ok(())
             },
 
-            TaskDone::Insert { key, serial, version, } => {
+            TaskDone::Insert { key, serial, version, action_start, } => {
                 db_mirror.commit_mutation(key, serial, version)?;
                 // log::debug!(" ;; inserted: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.inserts += 1;
                 active_tasks_counter.inserts -= 1;
+                TOTAL_INSERTS.fetch_add(1, atomic::Ordering::Relaxed);
+                TOTAL_INSERTS_MS.fetch_add(action_start.elapsed().as_micros() as usize, atomic::Ordering::Relaxed);
                 Ok(())
             },
 
-            TaskDone::Remove { key, serial, version, } => {
+            TaskDone::Remove { key, serial, version, action_start, } => {
                 db_mirror.commit_mutation(key, serial, version)?;
                 // log::debug!(" ;; removed: {:?}, serial: {serial}", &key.key_bytes[..]);
                 counter.removes += 1;
                 active_tasks_counter.removes -= 1;
+                TOTAL_REMOVES.fetch_add(1, atomic::Ordering::Relaxed);
+                TOTAL_REMOVES_MS.fetch_add(action_start.elapsed().as_micros() as usize, atomic::Ordering::Relaxed);
                 Ok(())
             },
 
-            TaskDone::Lookup { key, found_value_cell, committed, } => {
+            TaskDone::Lookup { key, found_value_cell, committed, action_start, } => {
                 match found_value_cell {
                     None =>
                         process_lookup_ready(
@@ -1059,6 +1114,7 @@ impl TaskDone {
                             key,
                             None,
                             committed,
+                            action_start,
                         ),
                     Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, }) =>
                         process_lookup_ready(
@@ -1068,6 +1124,7 @@ impl TaskDone {
                             key,
                             Some(kv::ValueCell { version, cell: kv::Cell::Tombstone, }),
                             committed,
+                            action_start,
                         ),
                     Some(kv::ValueCell { version, cell: kv::Cell::Value(value), }) => {
                         // calculate crc task
@@ -1076,6 +1133,7 @@ impl TaskDone {
                             found_version: version,
                             found_value: value,
                             committed,
+                            action_start,
                         };
                         let thread_pool = thread_pool.clone();
                         spawn_task(supervisor_pid, done_tx.clone(), async move {
@@ -1089,7 +1147,7 @@ impl TaskDone {
                 }
             },
 
-            TaskDone::LookupReady { key, found_value_cell, committed, } => {
+            TaskDone::LookupReady { key, found_value_cell, committed, action_start, } => {
                 process_lookup_ready(
                     db_mirror,
                     counter,
@@ -1097,6 +1155,7 @@ impl TaskDone {
                     key,
                     found_value_cell,
                     committed,
+                    action_start,
                 )
             },
 
@@ -1111,6 +1170,7 @@ fn process_lookup_ready(
     key: kv::Key,
     maybe_found_value_cell: Option<kv::ValueCell<ValueCrc64>>,
     committed: bool,
+    action_start: Instant,
 )
     -> Result<(), Error>
 {
@@ -1172,6 +1232,8 @@ fn process_lookup_ready(
 
     counter.lookups += 1;
     active_tasks_counter.lookups -= 1;
+    TOTAL_LOOKUPS.fetch_add(1, atomic::Ordering::Relaxed);
+    TOTAL_LOOKUPS_MS.fetch_add(action_start.elapsed().as_micros() as usize, atomic::Ordering::Relaxed);
     Ok(())
 }
 
