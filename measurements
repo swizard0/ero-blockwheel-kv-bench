@@ -1,22 +1,22 @@
-tree_block_size = 2048
+reference (only butcher): 27s / 40s
+============================================
 
-512  parallel: 131s / 244s
-1024 parallel: 119s / 246s
-2048 parallel: 126s / 242s
-3072 parallel: 131s / 247s
-4096 parallel: 134s / 261s
-6144 parallel: 154s / 275s
-8192 parallel: 149s / 268s
+// mutex lock edeltraud
 
-active_tasks = 1024
-
-1024 block size: 163s / 289s
-1536 block size: 143s / 259s
-2048 block size: 119s / 246s
-2560 block size: 116s / 251s
-3072 block size: 117s / 229s
-3584 block size: 117s / 235s
-4096 block size: 121s / 244s
+512  parallel | 2048 block size: 131s / 244s
+1024 parallel | 2048 block size: 119s / 246s
+2048 parallel | 2048 block size: 126s / 242s
+3072 parallel | 2048 block size: 131s / 247s
+4096 parallel | 2048 block size: 134s / 261s
+6144 parallel | 2048 block size: 154s / 275s
+8192 parallel | 2048 block size: 149s / 268s
+1024 parallel | 1024 block size: 163s / 289s
+1024 parallel | 1536 block size: 143s / 259s
+1024 parallel | 2048 block size: 119s / 246s
+1024 parallel | 2560 block size: 116s / 251s
+1024 parallel | 3072 block size: 117s / 229s
+1024 parallel | 3584 block size: 117s / 235s
+1024 parallel | 4096 block size: 121s / 244s
 
 // round table edeltraud
 

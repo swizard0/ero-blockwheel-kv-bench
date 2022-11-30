@@ -229,10 +229,11 @@ async fn run_blockwheel_kv(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
-    let thread_pool: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
+    let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
         .worker_threads(config.edeltraud.worker_threads)
         .build()
         .map_err(Error::ThreadPool)?;
+    let thread_pool = edeltraud.handle();
     let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
 
     // let mut db_files = Vec::new();
@@ -332,10 +333,11 @@ async fn run_sled(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
-    let thread_pool: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
+    let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
         .worker_threads(config.edeltraud.worker_threads)
         .build()
         .map_err(Error::ThreadPool)?;
+    let thread_pool = edeltraud.handle();
     let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
 
     let sled_tree = sled::Config::new()
