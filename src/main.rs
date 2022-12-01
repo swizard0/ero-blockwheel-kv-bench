@@ -73,6 +73,7 @@ use blockwheel_fs::{
     block,
 };
 
+mod burn;
 mod toml_config;
 
 pub static TOTAL_INSERTS: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -97,6 +98,7 @@ struct CliArgs {
 #[clap(about = "kv backend to use")]
 pub enum BackendCmd {
     BlockwheelKv,
+    BlockwheelKvBurn,
     Sled,
 }
 
@@ -116,7 +118,7 @@ pub enum Error {
     ConfigParse(toml::de::Error),
     SledInvalidMode { mode_provided: String, },
     TokioRuntime(io::Error),
-    ThreadPool(edeltraud::BuildError),
+    Env(EnvError),
     Edeltraud(edeltraud::SpawnError),
     InsertedValueNotFoundInDbMirror { key: DebugKey, },
     RemovedValueNotFoundInDbMirror { key: DebugKey, },
@@ -151,7 +153,7 @@ pub enum Error {
     FlushTimedOut,
     SledSerialize(bincode::Error),
     SledDeserialize(bincode::Error),
-    WheelsBuilder(wheels::Error),
+    Burn(burn::Error),
 }
 
 fn main() -> Result<(), Error> {
@@ -174,19 +176,30 @@ fn main() -> Result<(), Error> {
         .map_err(Error::TokioRuntime)?;
 
     let blocks_pool = BytesPool::new();
-    let mut db_mirror = DbMirror::new(&blocks_pool, &config.bench);
     let mut counter = Counter::default();
 
     match cli_args.backend_cmd {
         BackendCmd::BlockwheelKv => {
-            for fs_config in &config.blockwheel_wheels.fss {
+            let env = Env::new(blocks_pool, config)
+                .map_err(Error::Env)?;
+            let mut db_mirror = DbMirror::new(env.huge_random_block.clone());
+            for fs_config in &env.config.blockwheel_wheels.fss {
                 fs::remove_file(&fs_config.wheel_filename).ok();
             }
-            runtime.block_on(run_blockwheel_kv(blocks_pool, config, &mut db_mirror, &mut counter))?;
+            runtime.block_on(run_blockwheel_kv(env, &mut db_mirror, &mut counter))?;
         },
         BackendCmd::Sled => {
+            let mut db_mirror = DbMirror::new(
+                make_huge_random_block(&blocks_pool, &config.bench),
+            );
             fs::remove_dir_all(&config.sled.directory).ok();
             runtime.block_on(run_sled(blocks_pool, config, &mut db_mirror, &mut counter))?;
+        },
+        BackendCmd::BlockwheelKvBurn => {
+            let env = Env::new(blocks_pool, config)
+                .map_err(Error::Env)?;
+            return burn::run(env, runtime)
+                .map_err(Error::Burn);
         },
     }
 
@@ -217,9 +230,116 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn run_blockwheel_kv(
+#[allow(clippy::identity_op)]
+const HUGE_RANDOM_BLOCK_AMOUNT: usize = 1 * 1024 * 1024;
+
+fn make_huge_random_block(blocks_pool: &BytesPool, limits: &toml_config::Bench) -> Bytes {
+    let mut random_block = blocks_pool.lend();
+    let mut rng = SmallRng::from_entropy();
+    let mut huge_random_block_amount = HUGE_RANDOM_BLOCK_AMOUNT;
+    if huge_random_block_amount < limits.key_size_bytes {
+        huge_random_block_amount = limits.key_size_bytes;
+    }
+    if huge_random_block_amount < limits.value_size_bytes {
+        huge_random_block_amount = limits.value_size_bytes;
+    }
+    random_block.reserve(huge_random_block_amount);
+    for _ in 0 .. huge_random_block_amount {
+        random_block.push(rng.gen());
+    }
+    random_block.freeze()
+}
+
+struct Env {
     blocks_pool: BytesPool,
+    edeltraud: edeltraud::Edeltraud<Job>,
+    version_provider: blockwheel_kv_ero::version::Provider,
+    wheels: wheels::Wheels,
+    limits: Arc<toml_config::Bench>,
+    huge_random_block: Bytes,
     config: Config,
+}
+
+#[derive(Debug)]
+pub enum EnvError {
+    ThreadPool(edeltraud::BuildError),
+    WheelsBuilder(wheels::Error),
+}
+
+impl Env {
+    fn new(blocks_pool: BytesPool, config: Config) -> Result<Self, EnvError> {
+        let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
+            .worker_threads(config.edeltraud.worker_threads)
+            .build()
+            .map_err(EnvError::ThreadPool)?;
+        let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
+
+        let mut wheels = wheels::WheelsBuilder::new();
+        for fs_config in &config.blockwheel_wheels.fss {
+            let blockwheel_fs_params = blockwheel_fs::Params {
+                interpreter: match fs_config.interpreter {
+                    toml_config::BlockwheelInterpreter::FixedFile =>
+                        blockwheel_fs::InterpreterParams::FixedFile(blockwheel_fs::FixedFileInterpreterParams {
+                            wheel_filename: fs_config.wheel_filename.clone(),
+                            init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                        }),
+                    toml_config::BlockwheelInterpreter::Ram =>
+                        blockwheel_fs::InterpreterParams::Ram(blockwheel_fs::RamInterpreterParams {
+                            init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                        }),
+                    toml_config::BlockwheelInterpreter::Dummy =>
+                        blockwheel_fs::InterpreterParams::Dummy(blockwheel_fs::DummyInterpreterParams {
+                            init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                        }),
+                },
+                work_block_size_bytes: fs_config.work_block_size_bytes,
+                lru_cache_size_bytes: fs_config.lru_cache_size_bytes,
+                defrag_parallel_tasks_limit: fs_config.defrag_parallel_tasks_limit,
+            };
+
+            let blockwheel_filename = match &blockwheel_fs_params.interpreter {
+                blockwheel_fs::InterpreterParams::FixedFile(interpreter_params) =>
+                    interpreter_params.wheel_filename.clone(),
+                blockwheel_fs::InterpreterParams::Ram(..) |
+                blockwheel_fs::InterpreterParams::Dummy(..) => {
+                    ('a' ..= 'z')
+                        .choose_multiple(&mut rand::thread_rng(), 16)
+                        .into_iter()
+                        .collect::<String>()
+                        .into()
+                },
+            };
+
+            wheels.add_wheel_ref(wheels::WheelRef {
+                blockwheel_filename: wheels::WheelFilename::from_path(
+                    blockwheel_filename,
+                    &blocks_pool,
+                ),
+                blockwheel_fs_params,
+            });
+        }
+
+        let wheels = wheels.build()
+            .map_err(EnvError::WheelsBuilder)?;
+
+        let limits = Arc::new(config.bench.clone());
+
+        let huge_random_block = make_huge_random_block(&blocks_pool, &config.bench);
+
+        Ok(Self {
+            blocks_pool,
+            edeltraud,
+            version_provider,
+            wheels,
+            limits,
+            huge_random_block,
+            config,
+        })
+    }
+}
+
+async fn run_blockwheel_kv(
+    env: Env,
     db_mirror: &mut DbMirror,
     counter: &mut Counter,
 )
@@ -229,63 +349,7 @@ async fn run_blockwheel_kv(
     let mut supervisor_pid = supervisor_gen_server.pid();
     tokio::spawn(supervisor_gen_server.run());
 
-    let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
-        .worker_threads(config.edeltraud.worker_threads)
-        .build()
-        .map_err(Error::ThreadPool)?;
-    let thread_pool = edeltraud.handle();
-    let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
-
-    // let mut db_files = Vec::new();
-    // let mut wheel_refs = Vec::new();
-    let mut wheels = wheels::WheelsBuilder::new();
-    for fs_config in config.blockwheel_wheels.fss {
-        let blockwheel_fs_params = blockwheel_fs::Params {
-            interpreter: match fs_config.interpreter {
-                toml_config::BlockwheelInterpreter::FixedFile =>
-                    blockwheel_fs::InterpreterParams::FixedFile(blockwheel_fs::FixedFileInterpreterParams {
-                        wheel_filename: fs_config.wheel_filename,
-                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
-                    }),
-                toml_config::BlockwheelInterpreter::Ram =>
-                    blockwheel_fs::InterpreterParams::Ram(blockwheel_fs::RamInterpreterParams {
-                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
-                    }),
-                toml_config::BlockwheelInterpreter::Dummy =>
-                    blockwheel_fs::InterpreterParams::Dummy(blockwheel_fs::DummyInterpreterParams {
-                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
-                    }),
-            },
-            work_block_size_bytes: fs_config.work_block_size_bytes,
-            lru_cache_size_bytes: fs_config.lru_cache_size_bytes,
-            defrag_parallel_tasks_limit: fs_config.defrag_parallel_tasks_limit,
-        };
-
-        let blockwheel_filename = match &blockwheel_fs_params.interpreter {
-            blockwheel_fs::InterpreterParams::FixedFile(interpreter_params) =>
-                interpreter_params.wheel_filename.clone(),
-            blockwheel_fs::InterpreterParams::Ram(..) |
-            blockwheel_fs::InterpreterParams::Dummy(..) => {
-                ('a' ..= 'z')
-                    .choose_multiple(&mut rand::thread_rng(), 16)
-                    .into_iter()
-                    .collect::<String>()
-                    .into()
-            },
-        };
-
-        wheels.add_wheel_ref(wheels::WheelRef {
-            blockwheel_filename: wheels::WheelFilename::from_path(
-                blockwheel_filename,
-                &blocks_pool,
-            ),
-            blockwheel_fs_params,
-        });
-    }
-
-    let wheels = wheels.build()
-        .map_err(Error::WheelsBuilder)?;
-
+    let thread_pool = env.edeltraud.handle();
     let blockwheel_kv_gen_server = blockwheel_kv_ero::GenServer::new();
     let mut blockwheel_kv_pid = blockwheel_kv_gen_server.pid();
 
@@ -293,14 +357,14 @@ async fn run_blockwheel_kv(
         blockwheel_kv_gen_server.run(
             supervisor_pid.clone(),
             blockwheel_kv_ero::Params {
-                butcher_block_size: config.blockwheel_kv.butcher_block_size,
-                tree_block_size: config.blockwheel_kv.tree_block_size,
-                search_tree_values_inline_size_limit: config.blockwheel_kv.search_tree_values_inline_size_limit,
-                search_tree_bootstrap_search_trees_limit: config.blockwheel_kv.search_tree_bootstrap_search_trees_limit,
+                butcher_block_size: env.config.blockwheel_kv.butcher_block_size,
+                tree_block_size: env.config.blockwheel_kv.tree_block_size,
+                search_tree_values_inline_size_limit: env.config.blockwheel_kv.search_tree_values_inline_size_limit,
+                search_tree_bootstrap_search_trees_limit: env.config.blockwheel_kv.search_tree_bootstrap_search_trees_limit,
             },
-            blocks_pool.clone(),
-            version_provider.clone(),
-            wheels,
+            env.blocks_pool.clone(),
+            env.version_provider.clone(),
+            env.wheels,
             edeltraud::ThreadPoolMap::new(thread_pool.clone()),
         ),
     );
@@ -311,10 +375,10 @@ async fn run_blockwheel_kv(
             blockwheel_kv_pid: blockwheel_kv_pid.clone(),
         },
         db_mirror,
-        &blocks_pool,
-        &version_provider,
+        &env.blocks_pool,
+        &env.version_provider,
         counter,
-        Arc::new(config.bench),
+        env.limits.clone(),
         &thread_pool,
     ).await?;
 
@@ -340,7 +404,8 @@ async fn run_sled(
     let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
         .worker_threads(config.edeltraud.worker_threads)
         .build()
-        .map_err(Error::ThreadPool)?;
+        .map_err(EnvError::ThreadPool)
+        .map_err(Error::Env)?;
     let thread_pool = edeltraud.handle();
     let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
 
@@ -416,29 +481,12 @@ struct DbMirrorEntry {
     committed: bool,
 }
 
-#[allow(clippy::identity_op)]
-const HUGE_RANDOM_BLOCK_AMOUNT: usize = 1 * 1024 * 1024;
-
 impl DbMirror {
-    fn new(blocks_pool: &BytesPool, limits: &toml_config::Bench) -> Self {
-        let mut random_block = blocks_pool.lend();
-        let mut rng = SmallRng::from_entropy();
-        let mut huge_random_block_amount = HUGE_RANDOM_BLOCK_AMOUNT;
-        if huge_random_block_amount < limits.key_size_bytes {
-            huge_random_block_amount = limits.key_size_bytes;
-        }
-        if huge_random_block_amount < limits.value_size_bytes {
-            huge_random_block_amount = limits.value_size_bytes;
-        }
-        random_block.reserve(huge_random_block_amount);
-        for _ in 0 .. huge_random_block_amount {
-            random_block.push(rng.gen());
-        }
-
+    fn new(huge_random_block: Bytes) -> Self {
         Self {
             data: HashMap::new(),
             data_vec: Vec::new(),
-            huge_random_block: random_block.freeze(),
+            huge_random_block,
         }
     }
 
