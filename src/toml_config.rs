@@ -37,6 +37,8 @@ pub enum BlockwheelInterpreter {
     FixedFile,
     #[serde(rename = "ram")]
     Ram,
+    #[serde(rename = "dummy")]
+    Dummy,
 }
 
 #[derive(Clone, Deserialize, Debug)]

@@ -251,6 +251,10 @@ async fn run_blockwheel_kv(
                     blockwheel_fs::InterpreterParams::Ram(blockwheel_fs::RamInterpreterParams {
                         init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
                     }),
+                toml_config::BlockwheelInterpreter::Dummy =>
+                    blockwheel_fs::InterpreterParams::Dummy(blockwheel_fs::DummyInterpreterParams {
+                        init_wheel_size_bytes: fs_config.init_wheel_size_bytes,
+                    }),
             },
             work_block_size_bytes: fs_config.work_block_size_bytes,
             lru_cache_size_bytes: fs_config.lru_cache_size_bytes,
