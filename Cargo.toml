@@ -1,6 +1,6 @@
 [package]
 name = "ero-blockwheel-kv-bench"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Benchmark utility for key/value persistent store `ero-blockwheel-kv`."
 edition = "2021"
@@ -11,6 +11,7 @@ edeltraud = { git = "https://github.com/swizard0/edeltraud.git" }
 alloc-pool = { git = "https://github.com/swizard0/alloc-pool.git" }
 arbeitssklave = { git = "https://github.com/swizard0/arbeitssklave.git" }
 blockwheel-fs = { git = "https://github.com/swizard0/blockwheel-fs.git" }
+blockwheel-kv = { git = "https://github.com/swizard0/blockwheel-kv.git" }
 blockwheel-kv-ero = { git = "https://github.com/swizard0/blockwheel-kv-ero.git" }
 
 log = "^0.4"

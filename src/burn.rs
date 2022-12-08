@@ -55,6 +55,8 @@ pub(super) fn run(
 )
     -> Result<(), Error>
 {
+    log::info!("generating burn input data");
+
     let thread_pool = env.edeltraud.handle();
     let blockwheel_kv_gen_server = blockwheel_kv_ero::GenServer::new();
     let mut blockwheel_kv_pid = blockwheel_kv_gen_server.pid();
@@ -113,14 +115,14 @@ pub(super) fn run(
             async move {
                 match action {
                     Action::Insert { key_bytes, value_bytes, } => {
-                        let blockwheel_kv_ero::Inserted { .. } = blockwheel_kv_pid
+                        let blockwheel_kv::Inserted { .. } = blockwheel_kv_pid
                             .insert(key_bytes.into(), value_bytes.into())
                             .await
                             .map_err(Error::BlockwheelKvInsert)?;
                         Ok::<_, Error>(())
                     },
                     Action::Remove { key_bytes, } => {
-                        let blockwheel_kv_ero::Removed { .. } = blockwheel_kv_pid
+                        let blockwheel_kv::Removed { .. } = blockwheel_kv_pid
                             .remove(key_bytes.into())
                             .await
                             .map_err(Error::BlockwheelKvRemove)?;
@@ -138,6 +140,8 @@ pub(super) fn run(
         })
         .collect();
 
+    log::info!("generating done: total_inserts = {total_inserts}, total_removes = {total_removes}, total_lookups = {total_lookups}");
+
     let run_result = runtime.block_on(async {
         let supervisor_gen_server = SupervisorGenServer::new();
         let mut supervisor_pid = supervisor_gen_server.pid();
@@ -146,7 +150,7 @@ pub(super) fn run(
         supervisor_pid.spawn_link_permanent(
             blockwheel_kv_gen_server.run(
                 supervisor_pid.clone(),
-                blockwheel_kv_ero::Params {
+                blockwheel_kv::Params {
                     butcher_block_size: env.config.blockwheel_kv.butcher_block_size,
                     tree_block_size: env.config.blockwheel_kv.tree_block_size,
                     search_tree_values_inline_size_limit: env.config.blockwheel_kv.search_tree_values_inline_size_limit,
@@ -155,7 +159,7 @@ pub(super) fn run(
                 env.blocks_pool.clone(),
                 env.version_provider.clone(),
                 env.wheels,
-                edeltraud::ThreadPoolMap::new(thread_pool.clone()),
+                thread_pool.clone(),
             ),
         );
 
@@ -163,7 +167,7 @@ pub(super) fn run(
             future_result?;
         }
 
-        let blockwheel_kv_ero::Flushed = blockwheel_kv_pid.flush_all().await
+        let blockwheel_kv::Flushed = blockwheel_kv_pid.flush_all().await
             .map_err(Error::BlockwheelKvFlushAll)?;
 
         Ok(())

@@ -65,8 +65,11 @@ use ero::{
 };
 
 use blockwheel_kv_ero::{
-    kv,
     wheels,
+};
+
+use blockwheel_kv::{
+    kv,
 };
 
 use blockwheel_fs::{
@@ -253,7 +256,7 @@ fn make_huge_random_block(blocks_pool: &BytesPool, limits: &toml_config::Bench) 
 struct Env {
     blocks_pool: BytesPool,
     edeltraud: edeltraud::Edeltraud<Job>,
-    version_provider: blockwheel_kv_ero::version::Provider,
+    version_provider: blockwheel_kv::version::Provider,
     wheels: wheels::Wheels,
     limits: Arc<toml_config::Bench>,
     huge_random_block: Bytes,
@@ -268,11 +271,11 @@ pub enum EnvError {
 
 impl Env {
     fn new(blocks_pool: BytesPool, config: Config) -> Result<Self, EnvError> {
-        let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
+        let edeltraud = edeltraud::Builder::new()
             .worker_threads(config.edeltraud.worker_threads)
-            .build()
+            .build::<_, JobUnit<_>>()
             .map_err(EnvError::ThreadPool)?;
-        let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
+        let version_provider = blockwheel_kv::version::Provider::from_unix_epoch_seed();
 
         let mut wheels = wheels::WheelsBuilder::new();
         for fs_config in &config.blockwheel_wheels.fss {
@@ -356,7 +359,7 @@ async fn run_blockwheel_kv(
     supervisor_pid.spawn_link_permanent(
         blockwheel_kv_gen_server.run(
             supervisor_pid.clone(),
-            blockwheel_kv_ero::Params {
+            blockwheel_kv::Params {
                 butcher_block_size: env.config.blockwheel_kv.butcher_block_size,
                 tree_block_size: env.config.blockwheel_kv.tree_block_size,
                 search_tree_values_inline_size_limit: env.config.blockwheel_kv.search_tree_values_inline_size_limit,
@@ -365,7 +368,7 @@ async fn run_blockwheel_kv(
             env.blocks_pool.clone(),
             env.version_provider.clone(),
             env.wheels,
-            edeltraud::ThreadPoolMap::new(thread_pool.clone()),
+            thread_pool.clone(),
         ),
     );
 
@@ -403,11 +406,11 @@ async fn run_sled(
 
     let edeltraud: edeltraud::Edeltraud<Job> = edeltraud::Builder::new()
         .worker_threads(config.edeltraud.worker_threads)
-        .build()
+        .build::<_, JobUnit<_>>()
         .map_err(EnvError::ThreadPool)
         .map_err(Error::Env)?;
     let thread_pool = edeltraud.handle();
-    let version_provider = blockwheel_kv_ero::version::Provider::from_unix_epoch_seed();
+    let version_provider = blockwheel_kv::version::Provider::from_unix_epoch_seed();
 
     let sled_tree = sled::Config::new()
         .path(&config.sled.directory)
@@ -559,18 +562,20 @@ enum Backend {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stress_loop<P>(
+async fn stress_loop<J>(
     supervisor_pid: &mut SupervisorPid,
     mut backend: Backend,
     db_mirror: &mut DbMirror,
     blocks_pool: &BytesPool,
-    version_provider: &blockwheel_kv_ero::version::Provider,
+    version_provider: &blockwheel_kv::version::Provider,
     counter: &mut Counter,
     limits: Arc<toml_config::Bench>,
-    thread_pool: &P,
+    thread_pool: &edeltraud::Handle<J>,
 )
     -> Result<(), Error>
-where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
+where J: From<edeltraud::AsyncJob<PrepareInsertJob>>,
+      J: From<edeltraud::AsyncJob<CalculateCrcJob>>,
+      J: Send + 'static,
 {
     let mut rng = SmallRng::from_entropy();
     let p_distribution = Uniform::new(0.0, 1.0);
@@ -743,7 +748,7 @@ impl Backend {
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
-        version_provider: &blockwheel_kv_ero::version::Provider,
+        version_provider: &blockwheel_kv::version::Provider,
         key: kv::Key,
         value_block: Bytes,
         serial: usize,
@@ -756,7 +761,7 @@ impl Backend {
                 let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
                     let value = kv::Value { value_bytes: value_block, };
-                    let blockwheel_kv_ero::Inserted { version, } = blockwheel_kv_pid.insert(key.clone(), value).await
+                    let blockwheel_kv::Inserted { version, } = blockwheel_kv_pid.insert(key.clone(), value).await
                         .map_err(Error::BlockwheelKvInsert)?;
                     Ok(TaskDone::Insert { key, serial, version, action_start, })
                 });
@@ -873,7 +878,7 @@ impl Backend {
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
-        version_provider: &blockwheel_kv_ero::version::Provider,
+        version_provider: &blockwheel_kv::version::Provider,
         key: kv::Key,
         serial: usize,
         limits: &toml_config::Bench,
@@ -884,7 +889,7 @@ impl Backend {
             Backend::BlockwheelKv { blockwheel_kv_pid, .. } => {
                 let mut blockwheel_kv_pid = blockwheel_kv_pid.clone();
                 spawn_task(supervisor_pid, done_tx.clone(), async move {
-                    let blockwheel_kv_ero::Removed { version, } = blockwheel_kv_pid.remove(key.clone()).await
+                    let blockwheel_kv::Removed { version, } = blockwheel_kv_pid.remove(key.clone()).await
                         .map_err(Error::BlockwheelKvRemove)?;
                     Ok(TaskDone::Remove { key, serial, version, action_start, })
                 });
@@ -928,7 +933,7 @@ impl Backend {
                     op_timeout,
                     blockwheel_kv_pid.flush_all(),
                 );
-                let blockwheel_kv_ero::Flushed = flush_task.await
+                let blockwheel_kv::Flushed = flush_task.await
                     .map_err(|_| Error::FlushTimedOut)
                     .and_then(|result| result.map_err(Error::BlockwheelKvFlush))?;
                 log::info!("blockwheel_kv flushed");
@@ -955,34 +960,138 @@ enum Job {
 }
 
 impl From<blockwheel_kv_ero::job::Job> for Job {
-    fn from(job: blockwheel_kv_ero::job::Job) -> Job {
-        Job::BlockwheelKvEro(job)
+    fn from(job: blockwheel_kv_ero::job::Job) -> Self {
+        Self::BlockwheelKvEro(job)
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelFsJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelFsJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelFsSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelFsSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelFsBlockPrepareWriteJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelFsBlockPrepareWriteJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelFsBlockPrepareDeleteJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelFsBlockPrepareDeleteJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelFsBlockProcessReadJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelFsBlockProcessReadJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvFlushButcherSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvFlushButcherSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvLookupRangeMergeSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvLookupRangeMergeSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvMergeSearchTreesSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvMergeSearchTreesSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvDemolishSearchTreeSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvDemolishSearchTreeSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::BlockwheelKvPerformerSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::BlockwheelKvPerformerSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
+    }
+}
+
+impl From<blockwheel_kv_ero::job::FtdSklaveJob> for Job {
+    fn from(job: blockwheel_kv_ero::job::FtdSklaveJob) -> Self {
+        Self::BlockwheelKvEro(job.into())
     }
 }
 
 impl From<edeltraud::AsyncJob<PrepareInsertJob>> for Job {
-    fn from(job: edeltraud::AsyncJob<PrepareInsertJob>) -> Job {
-        Job::PrepareInsert(job)
+    fn from(job: edeltraud::AsyncJob<PrepareInsertJob>) -> Self {
+        Self::PrepareInsert(job)
     }
 }
 
 impl From<edeltraud::AsyncJob<CalculateCrcJob>> for Job {
-    fn from(job: edeltraud::AsyncJob<CalculateCrcJob>) -> Job {
-        Job::CalculateCrc(job)
+    fn from(job: edeltraud::AsyncJob<CalculateCrcJob>) -> Self {
+        Self::CalculateCrc(job)
     }
 }
 
-impl edeltraud::Job for Job {
-    fn run<P>(self, thread_pool: &P) where P: edeltraud::ThreadPool<Self> {
-        match self {
+pub struct JobUnit<J>(edeltraud::JobUnit<J, Job>);
+
+impl<J> From<edeltraud::JobUnit<J, Job>> for JobUnit<J> {
+    fn from(job_unit: edeltraud::JobUnit<J, Job>) -> Self {
+        Self(job_unit)
+    }
+}
+
+impl<J> edeltraud::Job for JobUnit<J>
+where J: From<blockwheel_kv_ero::job::BlockwheelFsSklaveJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelFsBlockPrepareWriteJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelFsBlockPrepareDeleteJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelFsBlockProcessReadJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelKvFlushButcherSklaveJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelKvLookupRangeMergeSklaveJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelKvMergeSearchTreesSklaveJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelKvDemolishSearchTreeSklaveJob>,
+      J: From<blockwheel_kv_ero::job::BlockwheelKvPerformerSklaveJob>,
+      J: From<blockwheel_kv_ero::job::FtdSklaveJob>,
+      J: Send + 'static,
+{
+    fn run(self) {
+        match self.0.job {
             Job::BlockwheelKvEro(job) => {
-                job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
+                let job_unit = blockwheel_kv_ero::job::JobUnit::from(edeltraud::JobUnit {
+                    handle: self.0.handle,
+                    job,
+                });
+                job_unit.run();
             },
             Job::PrepareInsert(job) => {
-                job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
+                let job_unit = edeltraud::JobUnit {
+                    handle: self.0.handle,
+                    job,
+                };
+                job_unit.run();
             },
             Job::CalculateCrc(job) => {
-                job.run(&edeltraud::ThreadPoolMap::new(thread_pool));
+                let job_unit = edeltraud::JobUnit {
+                    handle: self.0.handle,
+                    job,
+                };
+                job_unit.run();
             },
         }
     }
@@ -1092,22 +1201,23 @@ where T: Future<Output = Result<TaskDone, Error>> + Send + 'static
 
 impl TaskDone {
     #[allow(clippy::too_many_arguments)]
-    fn process<P>(
+    fn process<J>(
         self,
         backend: &mut Backend,
         db_mirror: &mut DbMirror,
         supervisor_pid: &mut SupervisorPid,
         done_tx: &mpsc::Sender<Result<TaskDone, Error>>,
         blocks_pool: &BytesPool,
-        version_provider: &blockwheel_kv_ero::version::Provider,
+        version_provider: &blockwheel_kv::version::Provider,
         counter: &mut Counter,
         active_tasks_counter: &mut Counter,
         actions_counter: &mut usize,
         limits: &toml_config::Bench,
-        thread_pool: &P,
+        thread_pool: &edeltraud::Handle<J>,
     )
         -> Result<(), Error>
-    where P: edeltraud::ThreadPool<Job> + Clone + Send + Sync + 'static,
+    where J: From<edeltraud::AsyncJob<CalculateCrcJob>>,
+          J: Send + 'static,
     {
         match self {
 
